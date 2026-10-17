@@ -331,7 +331,7 @@ class WarpEnv:
     num_balls = NUM_BALLS
 
     def __init__(self, bundle, num_envs=8, device="cuda:0", seed=7, jitter=.002,
-                 capture_graph=True, max_episode_steps=None):
+                 capture_graph=False, max_episode_steps=None):
         self.bundle, self.num_envs = bundle, int(num_envs)
         if self.num_envs < 1:
             raise ValueError("num_envs must be positive")

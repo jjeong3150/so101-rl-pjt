@@ -13,7 +13,7 @@ import traceback
 import numpy as np
 import torch
 
-from environment import CPUEnv, GOALS, TARGET_ORDER
+from environment import CPUEnv, GOALS, TARGET_ORDER, PLATE_HALF_SIZE, PLATE_TOP_Z
 from learning import ActorCritic
 
 
@@ -34,7 +34,7 @@ class LiveSO101Viewer:
         self.bundle = bundle
         self.seed = int(seed)
         self.jitter = float(jitter)
-        self.num_balls = int(getattr(bundle, "num_balls", 6))
+        self.num_balls = int(getattr(bundle, "num_balls", 1))
         self.target_cell = int(TARGET_ORDER[0])
         self.active_ball_index = 0
         self.filled_count = 0
@@ -54,26 +54,27 @@ class LiveSO101Viewer:
         self.scene = ViserMujocoScene(self.server, bundle.model, num_envs=1)
         self.server.scene.set_up_direction("+z")
         self.goal_labels = [self.server.scene.add_label(
-            f"/task_overlay/cell_{index + 1}", text=str(index + 1),
+            f"/task_overlay/plate_{index + 1}", text="목표 플레이트",
             position=tuple(goal + np.array([0., 0., .045])),
             font_size_mode="screen", font_screen_scale=.7,
             anchor="center-center",
         ) for index, goal in enumerate(GOALS)]
-        vertices = np.array([[-.024, -.024, 0.], [.024, -.024, 0.],
-                             [.024, .024, 0.], [-.024, .024, 0.]], dtype=np.float32)
+        half_x, half_y = map(float, PLATE_HALF_SIZE)
+        vertices = np.array([[-half_x, -half_y, 0.], [half_x, -half_y, 0.],
+                             [half_x, half_y, 0.], [-half_x, half_y, 0.]], dtype=np.float32)
         faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.uint32)
         self.fill_markers = [self.server.scene.add_mesh_simple(
             f"/task_overlay/filled_{index + 1}", vertices=vertices, faces=faces,
             color=(40, 185, 95), opacity=.35, side="double",
-            position=(float(goal[0]), float(goal[1]), .006), visible=False,
+            position=(float(goal[0]), float(goal[1]), float(PLATE_TOP_Z) + .001), visible=False,
         ) for index, goal in enumerate(GOALS)]
         self.target_marker = self.server.scene.add_mesh_simple(
             "/task_overlay/current_goal", vertices=vertices, faces=faces,
             color=(40, 150, 245), opacity=.4, side="double",
             position=(float(GOALS[self.target_cell, 0]),
-                      float(GOALS[self.target_cell, 1]), .0065),
+                      float(GOALS[self.target_cell, 1]), float(PLATE_TOP_Z) + .0015),
         )
-        self.goal_labels[self.target_cell].text = f"[ {self.target_cell + 1} ]"
+        self.goal_labels[self.target_cell].text = "목표 플레이트"
         self.scene.camera_tracking_enabled = False
         self.scene.set_refresh_handler(self.refresh_event.set)
         self.scene.create_visualization_gui(
@@ -87,22 +88,23 @@ class LiveSO101Viewer:
             self.pause = self.server.gui.add_checkbox(
                 "뷰어만 일시정지", initial_value=False,
             )
-            self.reset = self.server.gui.add_button("공 6개와 빈 트레이로 다시 시작")
+            self.reset = self.server.gui.add_button("공 1개와 빈 플레이트로 다시 시작")
             self.episode_text = self.server.gui.add_markdown("물리 시뮬레이션 준비 중")
             self.result_text = self.server.gui.add_markdown("완료된 화면 에피소드 없음")
             self.reward_chart = self.server.gui.add_uplot(
                 data=(np.array([0.]), np.array([np.nan])),
-                series=({}, {"label": "완료 에피소드 평균 보상", "stroke": "#2563eb"}),
+                series=({}, {"label": "학습 완료 에피소드 평균 보상", "stroke": "#2563eb"}),
                 scales={"x": {"time": False}}, height=170,
             )
             self.server.gui.add_markdown(
                 "**관절 움직임과 집게 개폐를 PPO 정책이 직접 결정합니다.**\n\n"
-                "파랑은 현재 목표 칸, 초록과 체크 표시는 현재 안정적으로 채워진 칸입니다. "
-                "목표 공과 칸을 알려 주지만 이동 경로와 집기 동작은 제공하지 않습니다.\n\n"
+                "파란 사각형은 평평한 목표 플레이트, 초록은 공이 안정적으로 안착한 상태입니다. "
+                "공을 실제로 잡아 들어 옮기고, 플레이트 위에 놓아야 성공입니다.\n\n"
                 "정책이 공을 집지 못하거나 불필요하게 움직일 수 있습니다. "
                 "학습 성공 여부는 실제 에피소드 결과로 확인하세요.\n\n"
                 "최신 가중치는 다음 전체 에피소드 시작 때 반영합니다. "
-                "이 화면은 GPU 학습과 별개인 CPU 평가이며 일시정지와 초기화는 학습에 영향을 주지 않습니다."
+                "이 화면은 GPU 학습과 별개인 CPU 평가입니다. 뷰어의 제어 스텝은 학습 업데이트 수와 다르며, "
+                "일시정지와 초기화는 학습에 영향을 주지 않습니다."
             )
         self.pause.on_update(self._set_pause)
         self.select.on_update(self._set_selection)
@@ -148,19 +150,15 @@ class LiveSO101Viewer:
         if score:
             measured = score.get("learned", score)
             rate = measured.get("success_rate")
-            count = measured.get("mean_filled_count")
             if rate is not None:
-                score_text = f"전체 성공률 {float(rate):.0%}"
-                if count is not None:
-                    score_text += f" · 평균 {float(count):.1f}/{self.num_balls}칸"
-        target_text = "전체 완료" if self.filled_count == self.num_balls else f"{self.target_cell + 1}번 칸"
+                score_text = f"플레이트 옮기기 성공률 {float(rate):.0%}"
+        placed_text = "안착 성공" if self.filled_count else "아직 미완료"
         version_text = (str(self.episode_policy_version)
                         if self.episode_policy_version is not None else "무작위 행동")
         self.status_text.content = (
             f"**{self.runner.status}** · {progress}\n\n"
             f"최근 고정 조건 평가: **{score_text}**\n\n"
-            f"현재 채운 칸: **{self.filled_count} / {self.num_balls}** · "
-            f"현재 목표: **{target_text}**\n\n"
+            f"화면의 공 1개: **{placed_text}** · 목표: **평평한 플레이트**\n\n"
             f"학습 최신 버전: **{getattr(self.runner, 'snapshot_version', 0)}** · "
             f"화면 에피소드 버전: **{version_text}**"
         )
@@ -172,33 +170,32 @@ class LiveSO101Viewer:
 
     def _update_progress(self, info):
         self.num_balls = int(info.get("num_balls", self.num_balls))
-        active = int(info.get("active_ball_index", 0))
-        active = min(self.num_balls - 1, max(0, active))
-        self.active_ball_index = active
-        target = info.get("target_cell", int(TARGET_ORDER[active]))
-        target = int(TARGET_ORDER[active]) if target is None else int(target)
-        target = min(len(GOALS) - 1, max(0, target))
-        mask = np.asarray(info.get("filled_mask", [False] * len(GOALS)), dtype=bool).reshape(len(GOALS))
-        self.target_cell = target
+        self.active_ball_index = 0
+        self.target_cell = 0
+        mask = np.asarray(info.get("filled_mask", [False]), dtype=bool).reshape(1)
         self.filled_count = int(info.get("filled_count", int(mask.sum())))
         self.filled_mask = mask.copy()
         self.target_marker.position = (
-            float(GOALS[target, 0]), float(GOALS[target, 1]), .0065,
+            float(GOALS[0, 0]), float(GOALS[0, 1]), float(PLATE_TOP_Z) + .0015,
         )
-        for index, (label, marker) in enumerate(zip(self.goal_labels, self.fill_markers)):
-            marker.visible = bool(mask[index])
-            label.text = f"{index + 1} ✓" if mask[index] else (
-                f"[ {index + 1} ]" if index == target else str(index + 1)
-            )
-        self.target_marker.visible = self.filled_count < self.num_balls
+        self.fill_markers[0].visible = bool(mask[0])
+        self.goal_labels[0].text = "플레이트 안착 ✓" if mask[0] else "목표 플레이트"
+        self.target_marker.visible = not bool(mask[0])
 
     def _update_episode_text(self, selection, step, env):
+        info = self.last_info
+        lifted = bool(info.get("all_lifted", [False])[0])
+        released = bool(info.get("all_released", [False])[0])
+        stable = int(info.get("stable_steps", [0])[0])
         self.episode_text.content = (
             f"**{selection}**\n\n"
-            f"현재 채운 칸 **{self.filled_count} / {self.num_balls}** · "
-            f"목표 공 {self.active_ball_index + 1}번\n\n"
-            f"단계 {step} / {getattr(self.bundle, 'episode_steps', 3000)} · "
-            f"시뮬레이션 {float(env.data.time):.1f}초"
+            f"들어 올림: **{'완료' if lifted else '대기'}** · "
+            f"놓기 이력: **{'있음' if released else '없음'}**\n\n"
+            f"안착 유지: **{stable} / 25 제어 스텝** · "
+            f"성공: **{'완료' if self.filled_count else '대기'}**\n\n"
+            f"뷰어 제어 스텝 {step} / {getattr(self.bundle, 'episode_steps', 1000)} · "
+            f"시뮬레이션 {float(env.data.time):.1f}초\n\n"
+            "이 제어 스텝은 GPU 학습의 업데이트 수와 별개입니다."
         )
 
     def _loop(self):
@@ -268,7 +265,7 @@ class LiveSO101Viewer:
                 self._update_episode_text(selection, step, env)
                 if terminated or truncated:
                     success = bool(info.get("success", False))
-                    result = "6칸 채우기 성공" if success else f"{self.filled_count}/6칸 · 전체 성공 조건 미충족"
+                    result = "공 1개 플레이트 옮기기 성공" if success else "플레이트 옮기기 미완료"
                     reason = info.get("failure", "")
                     reason_text = f" · 종료 정보 {reason}" if reason else ""
                     version_text = (str(self.episode_policy_version)

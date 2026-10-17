@@ -17,61 +17,64 @@ import warp as wp
 import mujoco_warp as mjw
 
 
-NUM_BALLS = 6
+TASK_ID = "so101_one_ball_flat_plate_v1"
+NUM_BALLS = 1
 ACTION_DIM = 6
-OBSERVATION_DIM = 118
+OBSERVATION_DIM = 47
 CONTROL_DT = .02
 SUBSTEPS = 20
-EPISODE_STEPS = 3000
+EPISODE_STEPS = 1000
 REWARD_GAMMA = .995
 ACTION_SCALE = np.array([.040, .035, .035, .050, .050, .060], dtype=np.float32)
 INITIAL_ARM_POSE = np.array([.3879075, -.9498327, .2974578, 1.65806, 1.584, .7], dtype=np.float32)
-SOURCES = np.array([[.18, -.03, .027], [.27, -.03, .027],
-                    [.18, -.085, .027], [.27, -.085, .027],
-                    [.18, -.14, .027], [.27, -.14, .027]], dtype=np.float32)
-GOALS = np.array([[x, y, .027] for x in [.20, .26] for y in [.04, .10, .16]], dtype=np.float32)
-TARGET_ORDER = np.array([5, 2, 4, 1, 3, 0], dtype=np.int64)
+BALL_RADIUS = .022
+PLATE_TOP_Z = .005
+PLATE_HALF_SIZE = np.array([.08, .08], dtype=np.float32)
+PLATE_SAFE_HALF_SIZE = PLATE_HALF_SIZE - BALL_RADIUS - .005
+SOURCES = np.array([[.23, -.085, .027]], dtype=np.float32)
+GOALS = np.array([[.23, .10, PLATE_TOP_Z + BALL_RADIUS]], dtype=np.float32)
+TARGET_ORDER = np.array([0], dtype=np.int64)
 BALL_GOALS = GOALS[TARGET_ORDER]
+LIFT_HEIGHT = .04
+LIFT_STEPS = 5
+STABLE_STEPS = 25
+PLACE_Z_TOLERANCE = .004
+PLACE_SPEED_LIMIT = .03
+SHAPING_SCALE = 3.
+FIRST_LIFT_REWARD = 3.
+SUCCESS_REWARD = 50.
+FAILURE_PENALTY = 10.
+TIME_PENALTY = .002
+ACTION_PENALTY = .001
+ACTION_CHANGE_PENALTY = .002
 THIRD_PARTY_LICENSES = """Robot model: Google DeepMind MuJoCo Menagerie,
 robotstudio_so101, Apache License 2.0. The original model LICENSE is downloaded
-with its assets. The task adds static containers and six physical free balls.
+with its assets. The task adds two flat pads and one physical free ball.
 No scripted picking controller or trajectory code is included in this module.
 """
 
 
 def _scene_xml(robot_xml):
     root = ET.parse(robot_xml).getroot()
-    root.set("model", "SO101_direct_RL_six_balls")
+    root.set("model", TASK_ID)
     root.find("compiler").set("meshdir", str(robot_xml.parent / "assets"))
     root.find("option").attrib.update(timestep=".001", iterations="100",
                                       ls_iterations="50", impratio="100", tolerance="1e-6")
     world = root.find("worldbody")
     ET.SubElement(world, "light", pos=".2 -.2 1.5", dir="0 0 -1")
     ET.SubElement(world, "geom", name="floor", type="plane", size="1 1 .1", rgba=".9 .92 .95 1")
-    ET.SubElement(world, "geom", name="basket_floor", type="box",
-                  pos=".23 -.085 .0025", size=".10 .10 .0025", rgba=".10 .40 .32 1")
-    for index, (x, y, sx, sy) in enumerate([
-        (.13, -.085, .003, .103), (.33, -.085, .003, .103),
-        (.23, -.185, .103, .003), (.23, .015, .103, .003),
-    ]):
-        ET.SubElement(world, "geom", name=f"basket_wall{index}", type="box",
-                      pos=f"{x} {y} .0175", size=f"{sx} {sy} .0175", rgba=".10 .40 .32 1")
-    ET.SubElement(world, "geom", name="tray_floor", type="box",
-                  pos=".23 .10 .0025", size=".063 .093 .0025", rgba=".77 .68 .48 1")
-    for index, x in enumerate([.17, .23, .29]):
-        ET.SubElement(world, "geom", name=f"tray_x_wall{index}", type="box",
-                      pos=f"{x} .10 .014", size=".002 .092 .009", rgba=".64 .52 .31 1")
-    for index, y in enumerate([.07, .13, .19]):
-        ET.SubElement(world, "geom", name=f"tray_y_wall{index}", type="box",
-                      pos=f".23 {y} .014", size=".062 .002 .009", rgba=".64 .52 .31 1")
-    colors = [".95 .22 .09 1", ".95 .55 .08 1", ".92 .78 .08 1",
-              ".15 .65 .35 1", ".15 .45 .90 1", ".60 .28 .85 1"]
-    for index, (position, color) in enumerate(zip(SOURCES, colors)):
-        body = ET.SubElement(world, "body", name=f"ball{index}",
-                             pos=" ".join(str(float(v)) for v in position))
-        ET.SubElement(body, "freejoint", name=f"ball_free{index}")
-        ET.SubElement(body, "geom", name=f"ball{index}", type="sphere", size=".022",
-                      mass=".025", friction="1.5 .02 .002", condim="6", rgba=color)
+    ET.SubElement(world, "geom", name="source_pad", type="box",
+                  pos=f"{SOURCES[0, 0]} {SOURCES[0, 1]} {PLATE_TOP_Z / 2}",
+                  size=f".06 .06 {PLATE_TOP_Z / 2}", rgba=".10 .40 .32 1")
+    ET.SubElement(world, "geom", name="plate", type="box",
+                  pos=f"{GOALS[0, 0]} {GOALS[0, 1]} {PLATE_TOP_Z / 2}",
+                  size=f"{PLATE_HALF_SIZE[0]} {PLATE_HALF_SIZE[1]} {PLATE_TOP_Z / 2}",
+                  friction="1.5 .02 .002", condim="6", rgba=".77 .68 .48 1")
+    body = ET.SubElement(world, "body", name="ball0",
+                         pos=" ".join(str(float(v)) for v in SOURCES[0]))
+    ET.SubElement(body, "freejoint", name="ball_free0")
+    ET.SubElement(body, "geom", name="ball0", type="sphere", size=str(BALL_RADIUS),
+                  mass=".025", friction="1.5 .02 .002", condim="6", rgba=".95 .22 .09 1")
     return ET.tostring(root, encoding="unicode")
 
 
@@ -93,6 +96,7 @@ class SceneBundle:
         self.initial_pose = np.clip(INITIAL_ARM_POSE, self.lower, self.upper).astype(np.float32)
         self.ball_body_ids = np.array([self.model.body(f"ball{k}").id for k in range(NUM_BALLS)])
         self.ball_geom_ids = np.array([self.model.geom(f"ball{k}").id for k in range(NUM_BALLS)])
+        self.plate_geom_id = self.model.geom("plate").id
         joints = [self.model.joint(f"ball_free{k}").id for k in range(NUM_BALLS)]
         self.ball_qpos_addresses = self.model.jnt_qposadr[joints].astype(int).copy()
         self.ball_dof_addresses = self.model.jnt_dofadr[joints].astype(int).copy()
@@ -107,13 +111,18 @@ class SceneBundle:
         return data.geom_xpos[self.tip_ids].mean(axis=0)
 
 
-def _potential_numpy(balls, aperture, left, right, lifted):
+def _potential_numpy(balls, aperture, left, right, lifted, released, plate_contacts):
+    """Bounded state score; only its discounted change enters the reward."""
     distance = np.linalg.norm(aperture - balls, axis=1)
     goal_distance = np.linalg.norm(balls - BALL_GOALS, axis=1)
-    height = np.clip((balls[:, 2] - SOURCES[:, 2]) / .12, 0, 1)
-    return (.3 * (1 - np.tanh(15 * distance)) + .4 * (left & right) + height +
-            1.5 * height * np.exp(-12 * goal_distance) +
-            2. * lifted * np.exp(-50 * goal_distance))
+    bilateral = left & right
+    height = np.clip((balls[:, 2] - SOURCES[:, 2]) / .06, 0, 1)
+    inside = (np.abs(balls[:, :2] - BALL_GOALS[:, :2]) <= PLATE_SAFE_HALF_SIZE).all(axis=1)
+    settled = (lifted & released & inside & plate_contacts & ~left & ~right)
+    return (.5 * (1 - np.tanh(10 * distance)) + .5 * bilateral +
+            .75 * height * bilateral + 1.5 * lifted * np.exp(-10 * goal_distance) +
+            3 * settled * np.exp(-100 * np.abs(balls[:, 2] - BALL_GOALS[:, 2])) *
+            np.clip(distance / .08, 0, 1))
 
 
 class CPUEnv:
@@ -164,6 +173,9 @@ class CPUEnv:
         self.rewarded = np.zeros(NUM_BALLS, dtype=bool)
         self.left_contacts = np.zeros(NUM_BALLS, dtype=bool)
         self.right_contacts = np.zeros(NUM_BALLS, dtype=bool)
+        self.plate_contacts = np.zeros(NUM_BALLS, dtype=bool)
+        self.previous_action = np.zeros(ACTION_DIM, dtype=np.float32)
+        self.reward_components = {}
         self.max_heights = SOURCES[:, 2].copy()
         self.total_return = 0.
         self.success = self.done = False
@@ -185,12 +197,14 @@ class CPUEnv:
             ((BALL_GOALS - balls) * 5).reshape(-1),
             self.filled, np.eye(NUM_BALLS)[self.active_ball_index], self.lifted,
             self.bilateral_seen, self.released,
-            np.clip(self.stable_steps / 25., 0, 1), np.clip(self.lift_steps / 10., 0, 1),
+            np.clip(self.stable_steps / STABLE_STEPS, 0, 1), np.clip(self.lift_steps / LIFT_STEPS, 0, 1),
             [max(0., 1 - self.step_index / self.episode_steps)],
+            self.left_contacts, self.right_contacts, self.plate_contacts, self.previous_action,
         ]).astype(np.float32)
 
     def _jaw_contacts(self):
-        contacts = np.zeros((NUM_BALLS, 2), dtype=bool)
+        """Read force-bearing jaw and plate contacts for the free ball."""
+        contacts = np.zeros((NUM_BALLS, 3), dtype=bool)
         lookup = {int(geom): k for k, geom in enumerate(self.bundle.ball_geom_ids)}
         force = np.zeros(6)
         for index, contact in enumerate(self.data.contact):
@@ -202,14 +216,14 @@ class CPUEnv:
                 ball, other = lookup.get(second), first
             if ball is None:
                 continue
-            body = int(self.model.geom_bodyid[other])
-            if body not in (self.bundle.left_body, self.bundle.right_body):
-                continue
             mujoco.mj_contactForce(self.model, self.data, index, force)
+            body = int(self.model.geom_bodyid[other])
             if force[0] > .05:
                 contacts[ball, 0] |= body == self.bundle.left_body
                 contacts[ball, 1] |= body == self.bundle.right_body
-        return contacts[:, 0], contacts[:, 1]
+            if force[0] > .02 and other == self.bundle.plate_geom_id:
+                contacts[ball, 2] = True
+        return contacts[:, 0], contacts[:, 1], contacts[:, 2]
 
     def _info(self):
         balls = self.data.qpos[self.bundle.ball_xyz_indices]
@@ -228,7 +242,9 @@ class CPUEnv:
             "stable_steps": self.stable_steps.tolist(), "success": bool(self.success),
             "return": float(self.total_return), "steps": int(self.step_index),
             "failure": self.failure, "episode_steps": self.episode_steps,
-            "control": "policy_joint_delta_targets",
+            "control": "policy_joint_delta_targets", "task_id": TASK_ID,
+            "plate_contacts": self.plate_contacts.tolist(),
+            "reward_components": dict(self.reward_components),
         }
 
     def step(self, raw_actions):
@@ -240,9 +256,11 @@ class CPUEnv:
         active = self.active_ball_index
         before = _potential_numpy(self.data.qpos[self.bundle.ball_xyz_indices],
                                    self.bundle.aperture(self.data), self.left_contacts,
-                                   self.right_contacts, self.lifted)[active]
+                                   self.right_contacts, self.lifted, self.released,
+                                   self.plate_contacts)[active]
         old_lifted = self.lifted.copy()
         action = np.tanh(raw)
+        action_change = action - self.previous_action
         self.joint_targets = np.clip(self.joint_targets + action * ACTION_SCALE,
                                      self.bundle.lower, self.bundle.upper)
         self.data.ctrl[:] = self.joint_targets
@@ -253,37 +271,51 @@ class CPUEnv:
         velocities = self.data.qvel[self.bundle.ball_velocity_indices]
         distance = np.linalg.norm(self.bundle.aperture(self.data) - balls, axis=1)
         speed = np.linalg.norm(velocities, axis=1)
-        errors = np.abs(balls[:, :2] - BALL_GOALS[:, :2]).max(axis=1)
-        left, right = self._jaw_contacts()
-        self.left_contacts, self.right_contacts = left, right
+        inside = (np.abs(balls[:, :2] - BALL_GOALS[:, :2]) <= PLATE_SAFE_HALF_SIZE).all(axis=1)
+        left, right, plate = self._jaw_contacts()
+        self.left_contacts, self.right_contacts, self.plate_contacts = left, right, plate
         self.bilateral_seen |= left & right
-        raised = (balls[:, 2] > .08) & (distance < .055) & left & right
+        raised = ((balls[:, 2] >= SOURCES[:, 2] + LIFT_HEIGHT) &
+                  (distance < .055) & left & right)
         self.lift_steps = np.where(raised, self.lift_steps + 1, 0)
-        self.lifted |= self.lift_steps >= 10
+        self.lifted |= self.lift_steps >= LIFT_STEPS
         self.released |= self.lifted & (self.data.qpos[5] > .6) & ~left & ~right & (distance > .045)
-        stable = (self.lifted & self.bilateral_seen & self.released &
-                  (errors < .0055) & (np.abs(balls[:, 2] - BALL_GOALS[:, 2]) < .004) &
-                  (speed < .03) & ~left & ~right & (distance > .06))
+        stable = (self.lifted & self.bilateral_seen & self.released & inside & plate &
+                  (np.abs(balls[:, 2] - BALL_GOALS[:, 2]) <= PLACE_Z_TOLERANCE) &
+                  (speed < PLACE_SPEED_LIMIT) & ~left & ~right & (distance > .06))
         self.stable_steps = np.where(stable, self.stable_steps + 1, 0)
-        self.filled = self.stable_steps >= 25
-        newly_filled = self.filled & ~self.rewarded
-        self.rewarded |= newly_filled
-        self.success = bool(self.filled.all())
-        after = _potential_numpy(balls, self.bundle.aperture(self.data), left, right, self.lifted)[active]
-        reward = (3 * (REWARD_GAMMA * after - before) - .01 - .005 * np.square(action).mean() +
-                  .01 * self.filled.sum() + 5 * (self.lifted & ~old_lifted).sum() +
-                  20 * newly_filled.sum() + 100 * self.success)
-        self.max_heights = np.maximum(self.max_heights, balls[:, 2])
-        self.total_return += float(reward)
-        self.step_index += 1
+        self.filled = self.stable_steps >= STABLE_STEPS
         finite = np.isfinite(self.data.qpos).all() and np.isfinite(self.data.qvel).all()
-        physical_failure = (not finite or (balls[:, 2] < -.02).any() or (np.abs(balls[:, :2]) > .65).any())
+        physical_failure = bool(not finite or (balls[:, 2] < -.02).any() or
+                                (np.abs(balls[:, :2]) > .65).any())
+        self.success = bool(self.filled.all() and not physical_failure)
         self.failure = "nonfinite_or_out_of_workspace" if physical_failure else ""
         terminated = bool(self.success or physical_failure)
+        # A true terminal has zero successor potential. Time limits bootstrap
+        # from the physical successor and therefore retain its potential.
+        after = 0. if terminated else _potential_numpy(
+            balls, self.bundle.aperture(self.data), left, right, self.lifted,
+            self.released, plate)[active]
+        self.reward_components = {
+            "progress": float(SHAPING_SCALE * (REWARD_GAMMA * after - before)),
+            "first_lift": float(FIRST_LIFT_REWARD * (self.lifted & ~old_lifted).sum()),
+            "success": float(SUCCESS_REWARD * self.success),
+            "failure": float(-FAILURE_PENALTY * physical_failure),
+            "time": -TIME_PENALTY,
+            "action": float(-ACTION_PENALTY * np.square(action).mean()),
+            "action_change": float(-ACTION_CHANGE_PENALTY * np.square(action_change).mean()),
+        }
+        reward = float(np.nan_to_num(sum(self.reward_components.values())))
+        self.previous_action = action.copy()
+        self.rewarded |= self.filled
+        self.max_heights = np.maximum(self.max_heights, balls[:, 2])
+        self.total_return += reward
+        self.step_index += 1
         truncated = bool(self.step_index >= self.episode_steps and not terminated)
         self.done = terminated or truncated
         self.last_info = self._info()
-        return self.observation(), float(reward), terminated, truncated, dict(self.last_info)
+        observation = np.nan_to_num(self.observation(), nan=0., posinf=0., neginf=0.)
+        return observation, reward, terminated, truncated, dict(self.last_info)
 
 
 @torch.inference_mode()
@@ -320,7 +352,8 @@ def evaluate_policy(bundle, policy=None, mode="learned", episodes=1, seed=2026,
         "release_rate": float(np.mean([np.mean(r["all_released"]) for r in results])),
         "episodes": results, "seed": int(seed), "jitter_m": float(jitter),
         "backend": "CPU MuJoCo evaluation", "mode": mode,
-        "success_contract": "all six physical balls currently stable in assigned cells after real grasp, lift and release",
+        "task_id": TASK_ID,
+        "success_contract": "one physically grasped and lifted ball released onto the flat plate, supported and stable for 0.5 seconds",
     }
 
 
@@ -351,6 +384,7 @@ class WarpEnv:
             self.geom_xpos = wp.to_torch(self.data.geom_xpos)
             self.sources = torch.as_tensor(SOURCES, dtype=torch.float32, device=self.device)
             self.goals = torch.as_tensor(BALL_GOALS, dtype=torch.float32, device=self.device)
+            self.safe_half_size = torch.as_tensor(PLATE_SAFE_HALF_SIZE, device=self.device)
             self.scale = torch.as_tensor(ACTION_SCALE, device=self.device)
             self.lower, self.upper = [torch.as_tensor(v, dtype=torch.float32, device=self.device)
                                       for v in (bundle.lower, bundle.upper)]
@@ -368,6 +402,7 @@ class WarpEnv:
             self.contact_force_view = wp.to_torch(self.contact_force_buf)
             self.steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
             self.joint_targets = self.initial_pose.expand(self.num_envs, ACTION_DIM).clone()
+            self.previous_action = torch.zeros_like(self.joint_targets)
             self.returns = torch.zeros(self.num_envs, device=self.device)
             shape = (self.num_envs, NUM_BALLS)
             self.lift_steps = torch.zeros(shape, dtype=torch.long, device=self.device)
@@ -379,6 +414,7 @@ class WarpEnv:
             self.rewarded = torch.zeros_like(self.lifted)
             self.left_contacts = torch.zeros_like(self.lifted)
             self.right_contacts = torch.zeros_like(self.lifted)
+            self.plate_contacts = torch.zeros_like(self.lifted)
             self.success = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
             self.reset_mask = torch.ones_like(self.success)
             self.wp_reset_mask = wp.from_torch(self.reset_mask)
@@ -416,12 +452,13 @@ class WarpEnv:
             (self.num_envs, NUM_BALLS, 2), device=self.device, generator=self.generator) - 1)
         self.qpos[:, self.ball_xyz_indices] = torch.where(mask[:, None, None], positions,
                                                          self.qpos[:, self.ball_xyz_indices])
+        self.previous_action.masked_fill_(mask[:, None], 0)
         self.steps.masked_fill_(mask, 0)
         self.returns.masked_fill_(mask, 0)
         for field in (self.lift_steps, self.stable_steps):
             field.masked_fill_(mask[:, None], 0)
         for field in (self.lifted, self.bilateral_seen, self.released, self.filled,
-                      self.rewarded, self.left_contacts, self.right_contacts):
+                      self.rewarded, self.left_contacts, self.right_contacts, self.plate_contacts):
             field.masked_fill_(mask[:, None], False)
         self.success.masked_fill_(mask, False)
 
@@ -451,18 +488,25 @@ class WarpEnv:
             ((self.goals - balls) * 5).reshape(self.num_envs, -1),
             self.filled.float(), torch.nn.functional.one_hot(self._active(), NUM_BALLS).float(),
             self.lifted.float(), self.bilateral_seen.float(), self.released.float(),
-            (self.stable_steps / 25.).clamp(0, 1), (self.lift_steps / 10.).clamp(0, 1),
+            (self.stable_steps / STABLE_STEPS).clamp(0, 1), (self.lift_steps / LIFT_STEPS).clamp(0, 1),
             (1 - self.steps[:, None] / self.episode_steps).clamp_min(0),
+            self.left_contacts.float(), self.right_contacts.float(), self.plate_contacts.float(),
+            self.previous_action,
         ], dim=1)
 
     def _potential(self):
         balls = self._balls()
         distance = (self._eef()[:, None, :] - balls).norm(dim=2)
         goal_distance = (balls - self.goals).norm(dim=2)
-        height = ((balls[:, :, 2] - self.sources[:, 2]) / .12).clamp(0, 1)
-        return (.3 * (1 - torch.tanh(15 * distance)) + .4 * (self.left_contacts & self.right_contacts) +
-                height + 1.5 * height * torch.exp(-12 * goal_distance) +
-                2 * self.lifted * torch.exp(-50 * goal_distance))
+        bilateral = self.left_contacts & self.right_contacts
+        height = ((balls[:, :, 2] - self.sources[:, 2]) / .06).clamp(0, 1)
+        inside = ((balls[:, :, :2] - self.goals[:, :2]).abs() <= self.safe_half_size).all(dim=2)
+        settled = (self.lifted & self.released & inside & self.plate_contacts &
+                   ~self.left_contacts & ~self.right_contacts)
+        return (.5 * (1 - torch.tanh(10 * distance)) + .5 * bilateral +
+                .75 * height * bilateral + 1.5 * self.lifted * torch.exp(-10 * goal_distance) +
+                3 * settled * torch.exp(-100 * (balls[:, :, 2] - self.goals[:, 2]).abs()) *
+                (distance / .08).clamp(0, 1))
 
     def _jaw_contacts(self):
         mjw.contact_force(self.model, self.data, self.contact_ids, False, self.contact_force_buf)
@@ -476,13 +520,17 @@ class WarpEnv:
         ball = torch.where(first >= 0, first, second)
         other = torch.where(first >= 0, safe[:, 1], safe[:, 0])
         valid = (active & valid_geom & (ball >= 0) & (world >= 0) & (world < self.num_envs) &
-                 (wp.to_torch(contact.dist) <= .0005) & (self.contact_force_view[:, 0] > .05))
+                 (wp.to_torch(contact.dist) <= .0005))
         bodies = self.geom_bodyid[other]
+        force = self.contact_force_view[:, 0]
         index = world.clamp(0, self.num_envs - 1) * NUM_BALLS + ball.clamp(0, NUM_BALLS - 1)
+        matches = [(bodies == self.bundle.left_body) & (force > .05),
+                   (bodies == self.bundle.right_body) & (force > .05),
+                   (other == self.bundle.plate_geom_id) & (force > .02)]
         result = []
-        for body in (self.bundle.left_body, self.bundle.right_body):
+        for match in matches:
             out = torch.zeros(self.num_envs * NUM_BALLS, device=self.device)
-            out.scatter_add_(0, index, (valid & (bodies == body)).float())
+            out.scatter_add_(0, index, (valid & match).float())
             result.append(out.reshape(self.num_envs, NUM_BALLS) > 0)
         return result
 
@@ -496,6 +544,7 @@ class WarpEnv:
             before = self._potential()[self.world, active]
             old_lifted = self.lifted.clone()
             action = raw.tanh()
+            action_change = action - self.previous_action
             self.joint_targets.copy_((self.joint_targets + action * self.scale).clamp(self.lower, self.upper))
             self.ctrl.copy_(self.joint_targets)
             if self.graph is not None:
@@ -508,33 +557,45 @@ class WarpEnv:
             distance = (self._eef()[:, None, :] - balls).norm(dim=2)
             speed = velocities.norm(dim=2)
             errors = (balls[:, :, :2] - self.goals[:, :2]).abs().amax(dim=2)
-            left, right = self._jaw_contacts()
+            inside = ((balls[:, :, :2] - self.goals[:, :2]).abs() <= self.safe_half_size).all(dim=2)
+            left, right, plate = self._jaw_contacts()
             self.left_contacts.copy_(left)
             self.right_contacts.copy_(right)
+            self.plate_contacts.copy_(plate)
             self.bilateral_seen.logical_or_(left & right)
-            raised = (balls[:, :, 2] > .08) & (distance < .055) & left & right
+            raised = ((balls[:, :, 2] >= self.sources[:, 2] + LIFT_HEIGHT) &
+                      (distance < .055) & left & right)
             self.lift_steps.copy_(torch.where(raised, self.lift_steps + 1, 0))
-            self.lifted.logical_or_(self.lift_steps >= 10)
+            self.lifted.logical_or_(self.lift_steps >= LIFT_STEPS)
             self.released.logical_or_(self.lifted & (self.qpos[:, 5:6] > .6) &
                                       ~left & ~right & (distance > .045))
-            stable = (self.lifted & self.bilateral_seen & self.released &
-                      (errors < .0055) & ((balls[:, :, 2] - self.goals[:, 2]).abs() < .004) &
-                      (speed < .03) & ~left & ~right & (distance > .06))
+            stable = (self.lifted & self.bilateral_seen & self.released & inside & plate &
+                      ((balls[:, :, 2] - self.goals[:, 2]).abs() <= PLACE_Z_TOLERANCE) &
+                      (speed < PLACE_SPEED_LIMIT) & ~left & ~right & (distance > .06))
             self.stable_steps.copy_(torch.where(stable, self.stable_steps + 1, 0))
-            self.filled.copy_(self.stable_steps >= 25)
-            newly_filled = self.filled & ~self.rewarded
-            self.rewarded.logical_or_(newly_filled)
-            self.success.copy_(self.filled.all(dim=1))
-            after = self._potential()[self.world, active]
-            reward = (3 * (REWARD_GAMMA * after - before) - .01 - .005 * action.square().mean(dim=1) +
-                      .01 * self.filled.sum(dim=1) + 5 * (self.lifted & ~old_lifted).sum(dim=1) +
-                      20 * newly_filled.sum(dim=1) + 100 * self.success)
-            self.returns.add_(reward)
-            self.steps.add_(1)
+            self.filled.copy_(self.stable_steps >= STABLE_STEPS)
             finite = torch.isfinite(self.qpos).all(dim=1) & torch.isfinite(self.qvel).all(dim=1)
             physical_failure = (~finite | (balls[:, :, 2] < -.02).any(dim=1) |
                                 (balls[:, :, :2].abs() > .65).any(dim=2).any(dim=1))
+            self.success.copy_(self.filled.all(dim=1) & ~physical_failure)
             terminated = physical_failure | self.success
+            after = self._potential()[self.world, active]
+            # A true terminal successor is absorbing; a time limit bootstraps.
+            after = torch.where(terminated, torch.zeros_like(after), after)
+            reward_components = {
+                "progress": SHAPING_SCALE * (REWARD_GAMMA * after - before),
+                "first_lift": FIRST_LIFT_REWARD * (self.lifted & ~old_lifted).sum(dim=1),
+                "success": SUCCESS_REWARD * self.success,
+                "failure": -FAILURE_PENALTY * physical_failure,
+                "time": torch.full_like(before, -TIME_PENALTY),
+                "action": -ACTION_PENALTY * action.square().mean(dim=1),
+                "action_change": -ACTION_CHANGE_PENALTY * action_change.square().mean(dim=1),
+            }
+            reward = torch.nan_to_num(sum(reward_components.values()), nan=0., posinf=0., neginf=0.)
+            self.previous_action.copy_(action)
+            self.rewarded.logical_or_(self.filled)
+            self.returns.add_(reward)
+            self.steps.add_(1)
             truncated = (self.steps >= self.episode_steps) & ~terminated
             done = terminated | truncated
             final_obs = torch.nan_to_num(self.observation(), nan=0., posinf=0., neginf=0.)
@@ -544,12 +605,16 @@ class WarpEnv:
             info = {
                 "final_obs": final_obs, "episode_returns": self.returns[done].clone(),
                 "episode_success": self.success[done].clone(),
+                "episode_lifted": self.lifted.any(dim=1)[done].clone(),
+                "episode_released": self.released.any(dim=1)[done].clone(),
                 "episode_filled_count": filled_count[done].clone(),
                 "episode_xy_error": errors[done].amax(dim=1).clone(),
                 "filled_count": filled_count.clone(), "filled_mask": grid.clone(),
                 "active_ball_index": active.clone(), "target_cell": self.grid_order[active],
+                "reward_components": {key: value.clone() for key, value in reward_components.items()},
+                "task_id": TASK_ID,
             }
             if bool(done.any()):
                 self._reset(done)
                 mjw.forward(self.model, self.data)
-            return self.observation(), torch.nan_to_num(reward), terminated, truncated, info
+            return self.observation(), reward, terminated, truncated, info

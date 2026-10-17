@@ -24,6 +24,8 @@ import torch
 from torch import nn
 from torch.distributions import Normal
 
+from environment import TASK_ID, REWARD_GAMMA, OBSERVATION_DIM, ACTION_DIM
+
 
 DEFAULT_CONFIG = {
     "seed": 7,
@@ -33,7 +35,7 @@ DEFAULT_CONFIG = {
     "epochs": 3,
     "minibatch_size": 256,
     "learning_rate": 3e-4,
-    "gamma": 0.995,
+    "gamma": REWARD_GAMMA,
     "gae_lambda": 0.95,
     "clip_coef": 0.2,
     "value_coef": 0.5,
@@ -54,7 +56,8 @@ ATTRIBUTION = {
     "action_semantics": "six raw Normal actions mapped by environment tanh to joint-target increments",
     "movement_source": "all joint and gripper movement commands are selected by the policy",
     "policy_observations": "privileged simulator state; no image encoder",
-    "episode_metrics": "success and filled counts refer to completed six-ball task episodes",
+    "episode_metrics": "success refers to one physically grasped, lifted and released ball resting on the flat plate",
+    "task_id": TASK_ID,
     "algorithm_reference": "https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/ppo_continuous_action.py",
     "execution_status": "source authored without execution or validation",
 }
@@ -177,7 +180,7 @@ class PPORunner:
         self.device = torch.device(device)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.metadata = _json_safe(metadata or {})
+        self.metadata = _json_safe({**dict(metadata or {}), "task_id": TASK_ID})
         self.versions = _versions()
         self.observation_dim = observation_dim or self.config.get("observation_dim")
         self.action_dim = int(action_dim)
@@ -209,6 +212,8 @@ class PPORunner:
         for key in ("gamma", "gae_lambda"):
             if not 0 <= self.config[key] <= 1:
                 raise ValueError(f"{key} must lie in [0, 1].")
+        if not math.isclose(self.config["gamma"], REWARD_GAMMA, rel_tol=0., abs_tol=1e-12):
+            raise ValueError(f"gamma must match the reward potential discount ({REWARD_GAMMA}).")
 
     def _initialize_policy(self, observation_dim, action_dim):
         with torch.random.fork_rng(devices=[]):
@@ -237,9 +242,16 @@ class PPORunner:
         if self._training or self.thread is not None:
             raise RuntimeError("Load a checkpoint before start().")
         payload = torch.load(path, map_location="cpu", weights_only=True)
+        if payload.get("task_id") != TASK_ID:
+            raise ValueError(
+                "Checkpoint task does not match the one-ball flat-plate task. "
+                "Six-ball grid checkpoints cannot be resumed; start a new policy."
+            )
         if payload.get("action_semantics") != ATTRIBUTION["action_semantics"]:
             raise ValueError("This is not a direct joint-increment checkpoint from this notebook.")
         obs_dim, act_dim = int(payload["observation_dim"]), int(payload["action_dim"])
+        if (obs_dim, act_dim) != (OBSERVATION_DIM, ACTION_DIM):
+            raise ValueError("Checkpoint dimensions do not match the current one-ball environment.")
         if self.observation_dim is not None and (obs_dim, act_dim) != (self.observation_dim, self.action_dim):
             raise ValueError("Checkpoint and environment dimensions differ.")
         if self.policy is None:
@@ -371,6 +383,7 @@ class PPORunner:
             dones = torch.empty((horizon, nenv), dtype=torch.bool, device=self.device)
             obs = self._observation(env.observation(), nenv)
             recent_returns, recent_success, recent_filled = [], [], []
+            recent_lifted, recent_released = [], []
             began = time.perf_counter()
             self.status = "학습 중"
             for local_update in range(1, cfg["updates"] + 1):
@@ -416,6 +429,13 @@ class PPORunner:
                             raise ValueError("Filled counts must contain completed episodes only.")
                         recent_filled.extend(finished_filled.tolist())
                         recent_filled = recent_filled[-100:]
+                    for key, recent in (("episode_lifted", recent_lifted),
+                                        ("episode_released", recent_released)):
+                        finished = torch.as_tensor(info[key]).detach().cpu()
+                        if finished.shape != (done_count,):
+                            raise ValueError(f"{key} must contain completed episodes only.")
+                        recent.extend(finished.bool().tolist())
+                        del recent[:-100]
                     self.total_steps += nenv
                 if partial:
                     break
@@ -464,6 +484,8 @@ class PPORunner:
                     "train_mean_return": float(np.mean(recent_returns)) if recent_returns else None,
                     "train_success_rate": float(np.mean(recent_success)) if recent_success else None,
                     "train_mean_filled_count": float(np.mean(recent_filled)) if recent_filled else None,
+                    "train_lift_rate": float(np.mean(recent_lifted)) if recent_lifted else None,
+                    "train_release_rate": float(np.mean(recent_released)) if recent_released else None,
                     "completed_episodes_window": len(recent_returns),
                     "ppo_loss": float(np.mean(losses)), "policy_loss": float(np.mean(policy_losses)),
                     "value_loss": float(np.mean(value_losses)), "entropy": float(np.mean(entropies)),
@@ -496,7 +518,8 @@ class PPORunner:
             with self.lock:
                 history, evaluations = copy.deepcopy(self.history), copy.deepcopy(self.evaluations)
                 payload = {
-                    "format_version": 2, "action_semantics": ATTRIBUTION["action_semantics"],
+                    "format_version": 3, "task_id": TASK_ID,
+                    "action_semantics": ATTRIBUTION["action_semantics"],
                     "policy": weights,
                     "optimizer": copy.deepcopy(self.optimizer.state_dict()) if self.optimizer is not None and not initial else None,
                     "initial_policy": copy.deepcopy(self.initial_weights),

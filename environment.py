@@ -26,7 +26,8 @@ SUBSTEPS = 20
 EPISODE_STEPS = 1000
 REWARD_GAMMA = .995
 ACTION_SCALE = np.array([.040, .035, .035, .050, .050, .060], dtype=np.float32)
-INITIAL_ARM_POSE = np.array([.3879075, -.9498327, .2974578, 1.65806, 1.584, .7], dtype=np.float32)
+# Flip the gripper and its camera mount by 180 degrees at episode reset.
+INITIAL_ARM_POSE = np.array([.3879075, -.9498327, .2974578, 1.65806, 1.584 - np.pi, .7], dtype=np.float32)
 BALL_RADIUS = .022
 PLATE_TOP_Z = .005
 PLATE_HALF_SIZE = np.array([.08, .08], dtype=np.float32)

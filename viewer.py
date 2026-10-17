@@ -1,0 +1,298 @@
+"""Browser visualization of an independent direct-policy CPU rollout.
+
+The RL policy chooses all arm-joint and gripper target increments. This viewer
+does not contain a trajectory, an inverse-kinematics planner, or a scripted pick.
+"""
+from __future__ import annotations
+
+import contextlib
+import threading
+import time
+import traceback
+
+import numpy as np
+import torch
+
+from environment import CPUEnv, GOALS, TARGET_ORDER
+from learning import ActorCritic
+
+
+class LiveSO101Viewer:
+    """Show one CPU policy rollout with 50 Hz control and 15 fps visualization.
+
+    Only the worker thread owns its MuJoCo data. GUI callbacks communicate
+    through events; copied network weights stay fixed for a whole episode.
+    """
+
+    MODES = ("학습 시작 시 정책", "최신 정책", "무작위 행동")
+
+    def __init__(self, runner, bundle, port=8081, seed=2026, jitter=.002):
+        import viser
+        from mjviser import ViserMujocoScene
+
+        self.runner = runner
+        self.bundle = bundle
+        self.seed = int(seed)
+        self.jitter = float(jitter)
+        self.num_balls = int(getattr(bundle, "num_balls", 6))
+        self.target_cell = int(TARGET_ORDER[0])
+        self.active_ball_index = 0
+        self.filled_count = 0
+        self.filled_mask = np.zeros(len(GOALS), dtype=bool)
+        self.reset_event = threading.Event()
+        self.refresh_event = threading.Event()
+        self.stop_event = threading.Event()
+        self.pause_event = threading.Event()
+        self.selection_lock = threading.Lock()
+        self.selection = "최신 정책"
+        self.error = None
+        self.data = None
+        self.last_info = {}
+        self.episode_policy_version = None
+        self.closed = False
+        self.server = viser.ViserServer(host="127.0.0.1", port=port)
+        self.scene = ViserMujocoScene(self.server, bundle.model, num_envs=1)
+        self.server.scene.set_up_direction("+z")
+        self.goal_labels = [self.server.scene.add_label(
+            f"/task_overlay/cell_{index + 1}", text=str(index + 1),
+            position=tuple(goal + np.array([0., 0., .045])),
+            font_size_mode="screen", font_screen_scale=.7,
+            anchor="center-center",
+        ) for index, goal in enumerate(GOALS)]
+        vertices = np.array([[-.024, -.024, 0.], [.024, -.024, 0.],
+                             [.024, .024, 0.], [-.024, .024, 0.]], dtype=np.float32)
+        faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.uint32)
+        self.fill_markers = [self.server.scene.add_mesh_simple(
+            f"/task_overlay/filled_{index + 1}", vertices=vertices, faces=faces,
+            color=(40, 185, 95), opacity=.35, side="double",
+            position=(float(goal[0]), float(goal[1]), .006), visible=False,
+        ) for index, goal in enumerate(GOALS)]
+        self.target_marker = self.server.scene.add_mesh_simple(
+            "/task_overlay/current_goal", vertices=vertices, faces=faces,
+            color=(40, 150, 245), opacity=.4, side="double",
+            position=(float(GOALS[self.target_cell, 0]),
+                      float(GOALS[self.target_cell, 1]), .0065),
+        )
+        self.goal_labels[self.target_cell].text = f"[ {self.target_cell + 1} ]"
+        self.scene.camera_tracking_enabled = False
+        self.scene.set_refresh_handler(self.refresh_event.set)
+        self.scene.create_visualization_gui(
+            camera_distance=1.25, camera_azimuth=130, camera_elevation=30,
+        )
+        with self.server.gui.add_folder("강화학습과 평가"):
+            self.status_text = self.server.gui.add_markdown("정책 평가 화면 준비 중")
+            self.select = self.server.gui.add_dropdown(
+                "표시할 정책", self.MODES, initial_value="최신 정책",
+            )
+            self.pause = self.server.gui.add_checkbox(
+                "뷰어만 일시정지", initial_value=False,
+            )
+            self.reset = self.server.gui.add_button("공 6개와 빈 트레이로 다시 시작")
+            self.episode_text = self.server.gui.add_markdown("물리 시뮬레이션 준비 중")
+            self.result_text = self.server.gui.add_markdown("완료된 화면 에피소드 없음")
+            self.reward_chart = self.server.gui.add_uplot(
+                data=(np.array([0.]), np.array([np.nan])),
+                series=({}, {"label": "완료 에피소드 평균 보상", "stroke": "#2563eb"}),
+                scales={"x": {"time": False}}, height=170,
+            )
+            self.server.gui.add_markdown(
+                "**관절 움직임과 집게 개폐를 PPO 정책이 직접 결정합니다.**\n\n"
+                "파랑은 현재 목표 칸, 초록과 체크 표시는 현재 안정적으로 채워진 칸입니다. "
+                "목표 공과 칸을 알려 주지만 이동 경로와 집기 동작은 제공하지 않습니다.\n\n"
+                "정책이 공을 집지 못하거나 불필요하게 움직일 수 있습니다. "
+                "학습 성공 여부는 실제 에피소드 결과로 확인하세요.\n\n"
+                "최신 가중치는 다음 전체 에피소드 시작 때 반영합니다. "
+                "이 화면은 GPU 학습과 별개인 CPU 평가이며 일시정지와 초기화는 학습에 영향을 주지 않습니다."
+            )
+        self.pause.on_update(self._set_pause)
+        self.select.on_update(self._set_selection)
+        self.reset.on_click(lambda _: self.reset_event.set())
+        self.thread = threading.Thread(
+            target=self._loop_guarded, name="SO101-direct-policy-viewer", daemon=True,
+        )
+        self.thread.start()
+
+    def _set_pause(self, _):
+        (self.pause_event.set if self.pause.value else self.pause_event.clear)()
+
+    def _set_selection(self, _):
+        with self.selection_lock:
+            self.selection = self.select.value
+        self.reset_event.set()
+
+    def _loop_guarded(self):
+        try:
+            self._loop()
+        except Exception:
+            self.error = traceback.format_exc()
+            self.status_text.content = "**뷰어 평가 오류** — 노트북의 오류 로그를 확인하세요."
+            print(self.error)
+
+    def _history(self):
+        lock = getattr(self.runner, "lock", None)
+        with lock if lock is not None else contextlib.nullcontext():
+            return [dict(row) for row in self.runner.history]
+
+    def _update_status(self):
+        history = self._history()
+        if history:
+            rewards = [row.get("train_mean_return") for row in history]
+            self.reward_chart.data = (
+                np.asarray([row.get("steps", 0) for row in history], dtype=float),
+                np.asarray([np.nan if item is None else item for item in rewards], dtype=float),
+            )
+        completed_updates = int(getattr(self.runner, "completed_updates", 0))
+        progress = f"{completed_updates} / {self.runner.config.get('updates', '?')} 업데이트"
+        score = getattr(self.runner, "final_evaluation", None)
+        score_text = "평가 대기"
+        if score:
+            measured = score.get("learned", score)
+            rate = measured.get("success_rate")
+            count = measured.get("mean_filled_count")
+            if rate is not None:
+                score_text = f"전체 성공률 {float(rate):.0%}"
+                if count is not None:
+                    score_text += f" · 평균 {float(count):.1f}/{self.num_balls}칸"
+        target_text = "전체 완료" if self.filled_count == self.num_balls else f"{self.target_cell + 1}번 칸"
+        version_text = (str(self.episode_policy_version)
+                        if self.episode_policy_version is not None else "무작위 행동")
+        self.status_text.content = (
+            f"**{self.runner.status}** · {progress}\n\n"
+            f"최근 고정 조건 평가: **{score_text}**\n\n"
+            f"현재 채운 칸: **{self.filled_count} / {self.num_balls}** · "
+            f"현재 목표: **{target_text}**\n\n"
+            f"학습 최신 버전: **{getattr(self.runner, 'snapshot_version', 0)}** · "
+            f"화면 에피소드 버전: **{version_text}**"
+        )
+
+    @staticmethod
+    def _reset(env, seed):
+        result = env.reset(seed=seed)
+        return np.asarray(result[0] if isinstance(result, tuple) else result, dtype=np.float32)
+
+    def _update_progress(self, info):
+        self.num_balls = int(info.get("num_balls", self.num_balls))
+        active = int(info.get("active_ball_index", 0))
+        active = min(self.num_balls - 1, max(0, active))
+        self.active_ball_index = active
+        target = info.get("target_cell", int(TARGET_ORDER[active]))
+        target = int(TARGET_ORDER[active]) if target is None else int(target)
+        target = min(len(GOALS) - 1, max(0, target))
+        mask = np.asarray(info.get("filled_mask", [False] * len(GOALS)), dtype=bool).reshape(len(GOALS))
+        self.target_cell = target
+        self.filled_count = int(info.get("filled_count", int(mask.sum())))
+        self.filled_mask = mask.copy()
+        self.target_marker.position = (
+            float(GOALS[target, 0]), float(GOALS[target, 1]), .0065,
+        )
+        for index, (label, marker) in enumerate(zip(self.goal_labels, self.fill_markers)):
+            marker.visible = bool(mask[index])
+            label.text = f"{index + 1} ✓" if mask[index] else (
+                f"[ {index + 1} ]" if index == target else str(index + 1)
+            )
+        self.target_marker.visible = self.filled_count < self.num_balls
+
+    def _update_episode_text(self, selection, step, env):
+        self.episode_text.content = (
+            f"**{selection}**\n\n"
+            f"현재 채운 칸 **{self.filled_count} / {self.num_balls}** · "
+            f"목표 공 {self.active_ball_index + 1}번\n\n"
+            f"단계 {step} / {getattr(self.bundle, 'episode_steps', 3000)} · "
+            f"시뮬레이션 {float(env.data.time):.1f}초"
+        )
+
+    def _loop(self):
+        env = CPUEnv(self.bundle, seed=self.seed, jitter=self.jitter)
+        self.data = env.data
+        policy = ActorCritic(env.observation_dim, env.action_dim).cpu().eval()
+        obs = self._reset(env, self.seed)
+        rng = np.random.default_rng(self.seed + 1)
+        previous_selection = None
+        policy_version = -1
+        step = 0
+        total_reward = 0.
+        last_render = 0.
+        last_status = 0.
+        terminal_hold_until = None
+        self.last_info = dict(getattr(env, "last_info", {}))
+        self._update_progress(self.last_info)
+        self.refresh_event.set()
+        while not self.stop_event.is_set():
+            begin = time.perf_counter()
+            with self.selection_lock:
+                selection = self.selection
+            if selection != previous_selection:
+                self.reset_event.set()
+            if self.reset_event.is_set():
+                self.reset_event.clear()
+                obs = self._reset(env, self.seed)
+                self.last_info = dict(getattr(env, "last_info", {}))
+                self._update_progress(self.last_info)
+                rng = np.random.default_rng(self.seed + 1)
+                step, total_reward, terminal_hold_until = 0, 0., None
+                self._update_episode_text(selection, step, env)
+                self.refresh_event.set()
+            paused = self.pause_event.is_set()
+            if terminal_hold_until is not None and begin >= terminal_hold_until and not paused:
+                obs = self._reset(env, self.seed)
+                self.last_info = dict(getattr(env, "last_info", {}))
+                self._update_progress(self.last_info)
+                rng = np.random.default_rng(self.seed + 1)
+                step, total_reward, terminal_hold_until = 0, 0., None
+                self._update_episode_text(selection, step, env)
+                self.refresh_event.set()
+            latest_version = int(getattr(self.runner, "snapshot_version", 0))
+            learned_mode = selection in ("학습 시작 시 정책", "최신 정책")
+            needs_weights = learned_mode and (
+                selection != previous_selection or
+                (selection == "최신 정책" and step == 0 and latest_version != policy_version)
+            )
+            if needs_weights:
+                weights, policy_version = self.runner.snapshot(initial=selection == "학습 시작 시 정책")
+                if weights is not None:
+                    policy.load_state_dict(weights)
+            previous_selection = selection
+            self.episode_policy_version = policy_version if learned_mode else None
+            if not paused and terminal_hold_until is None:
+                if selection == "무작위 행동":
+                    action = rng.standard_normal(env.action_dim).astype(np.float32)
+                else:
+                    with torch.inference_mode():
+                        action = policy.actor(torch.from_numpy(obs).unsqueeze(0)).squeeze(0).numpy()
+                obs, reward, terminated, truncated, info = env.step(action)
+                obs = np.asarray(obs, dtype=np.float32)
+                step += 1
+                total_reward += float(reward)
+                self.last_info = dict(info)
+                self._update_progress(info)
+                self._update_episode_text(selection, step, env)
+                if terminated or truncated:
+                    success = bool(info.get("success", False))
+                    result = "6칸 채우기 성공" if success else f"{self.filled_count}/6칸 · 전체 성공 조건 미충족"
+                    reason = info.get("failure", "")
+                    reason_text = f" · 종료 정보 {reason}" if reason else ""
+                    version_text = (str(self.episode_policy_version)
+                                    if self.episode_policy_version is not None else "무작위 행동")
+                    self.result_text.content = (
+                        f"직전 결과: **{result}**\n\n"
+                        f"누적 보상 {total_reward:.2f} · 평가 시드 {self.seed} · "
+                        f"정책 버전 {version_text}{reason_text}"
+                    )
+                    terminal_hold_until = begin + 2.
+                    self.refresh_event.set()
+            if self.refresh_event.is_set() or begin - last_render >= 1. / 15.:
+                self.scene.update_from_mjdata(env.data)
+                self.refresh_event.clear()
+                last_render = begin
+            if begin - last_status >= .5:
+                self._update_status()
+                last_status = begin
+            self.stop_event.wait(max(0., float(self.bundle.control_dt) - (time.perf_counter() - begin)))
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.stop_event.set()
+        self.thread.join(timeout=3.)
+        self.server.stop()

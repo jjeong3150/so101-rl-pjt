@@ -1,0 +1,7 @@
+mujoco==3.16.0
+mujoco-warp==3.16.0
+warp-lang @ https://github.com/NVIDIA/warp/releases/download/v1.18.0/warp_lang-1.18.0+cu12-py3-none-manylinux_2_28_x86_64.whl#sha256=6dda3c163dde4edaa7d46ade9fff3ddb1126ee7b147d9d890cd38cc70dafd656
+mjviser==0.0.14
+viser==1.1.1
+numpy
+matplotlib

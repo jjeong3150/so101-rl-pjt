@@ -337,6 +337,8 @@ class WarpEnv:
             raise ValueError("num_envs must be positive")
         self.episode_steps = int(max_episode_steps or bundle.episode_steps)
         self.device = torch.device(device)
+        # Torch stream conversion requires Warp's runtime to exist first.
+        wp.init()
         self.wp_device = str(self.device) if self.device.type == "cuda" else "cpu"
         self.generator = torch.Generator(device=self.device).manual_seed(seed)
         self.stream = (wp.stream_from_torch(torch.cuda.current_stream(self.device))

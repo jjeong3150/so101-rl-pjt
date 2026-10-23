@@ -23,7 +23,7 @@ TASK_ID = "so101_one_ball_flat_plate_vision_v1"
 NUM_BALLS = 1
 ACTION_DIM = 6
 OBSERVATION_DIM = 25
-CAMERA_NAMES = ("wrist_cam", "overview_cam")
+CAMERA_NAMES = ("wrist_cam",)
 IMAGE_SIZE = 64
 IMAGE_INTERVAL = 4
 FRAME_STACK = 2
@@ -81,9 +81,6 @@ def _scene_xml(robot_xml):
     root.find("option").attrib.update(timestep=".001", iterations="100",
                                       ls_iterations="50", impratio="100", tolerance="1e-6")
     world = root.find("worldbody")
-    # A fixed workspace view complements the moving wrist camera.
-    ET.SubElement(world, "camera", name="overview_cam", pos=".55 -.45 .55",
-                  xyaxes=".8159 .5800 0 -.419 .589 .694", fovy="52")
     ET.SubElement(world, "light", pos=".2 -.2 1.5", dir="0 0 -1")
     ET.SubElement(world, "geom", name="floor", type="plane", size="1 1 .1", rgba=".9 .92 .95 1")
     ET.SubElement(world, "geom", name="source_pad", type="box",

@@ -113,14 +113,14 @@ class LiveSO101Viewer:
             )
         with self.server.gui.add_folder("정책이 보는 영상"):
             self.server.gui.add_markdown(
-                "정책에 실제로 전달한 두 카메라의 최신 RGB 프레임입니다. "
+                "정책에 실제로 전달한 손목 카메라의 최신 RGB 프레임입니다. "
                 "각 영상은 64×64 픽셀이며, 직전·현재 두 프레임과 "
                 "관절 관련 수치 25개로 움직임을 결정합니다. "
                 "영상은 12.5Hz로 갱신합니다. 공의 정확한 좌표는 정책에 전달하지 않습니다."
             )
             self.policy_images = [self.server.gui.add_image(
                 np.zeros((IMAGE_SHAPE[1], IMAGE_SHAPE[2], 3), dtype=np.uint8),
-                label=("손목 카메라" if name == "wrist_cam" else "고정 카메라"),
+                label="손목 카메라",
                 format="png",
             ) for name in CAMERA_NAMES]
         self.pause.on_update(self._set_pause)

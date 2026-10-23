@@ -12,6 +12,7 @@ import threading
 import time
 import traceback
 
+import mujoco
 import numpy as np
 import torch
 
@@ -55,6 +56,14 @@ class LiveSO101Viewer:
         self.closed = False
         self.server = viser.ViserServer(host="127.0.0.1", port=port)
         self.scene = ViserMujocoScene(self.server, bundle.model, num_envs=1)
+        # mjviser creates dynamic links at the origin until the first pose update.
+        # Publish a posed preview before native camera setup/compilation begins.
+        preview_data = mujoco.MjData(bundle.model)
+        preview_data.qpos[:bundle.action_dim] = bundle.initial_pose
+        preview_data.ctrl[:] = bundle.initial_pose
+        mujoco.mj_forward(bundle.model, preview_data)
+        self.scene.update_from_mjdata(preview_data)
+        self.data = preview_data
         self.server.scene.set_up_direction("+z")
         self.goal_labels = [self.server.scene.add_label(
             f"/task_overlay/plate_{index + 1}", text="목표 플레이트",
@@ -84,7 +93,7 @@ class LiveSO101Viewer:
             camera_distance=1.25, camera_azimuth=130, camera_elevation=30,
         )
         with self.server.gui.add_folder("강화학습과 평가"):
-            self.status_text = self.server.gui.add_markdown("정책 평가 화면 준비 중")
+            self.status_text = self.server.gui.add_markdown("손목 카메라 준비 중 · 3D 초기 자세 표시")
             self.select = self.server.gui.add_dropdown(
                 "표시할 정책", self.MODES, initial_value="최신 정책",
             )

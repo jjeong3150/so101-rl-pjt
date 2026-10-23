@@ -16,8 +16,7 @@ import mujoco
 import numpy as np
 import torch
 
-from environment import (CPUEnv, GOALS, TARGET_ORDER, PLATE_HALF_SIZE, PLATE_TOP_Z,
-                         CAMERA_NAMES, IMAGE_SHAPE)
+from environment import CPUEnv, GOALS, TARGET_ORDER, CAMERA_NAMES, IMAGE_SHAPE
 from learning import ActorCritic, batch_observation
 
 
@@ -68,27 +67,13 @@ class LiveSO101Viewer:
         self.data = preview_data
         self.server.scene.set_up_direction("+z")
         self.goal_labels = [self.server.scene.add_label(
-            f"/task_overlay/plate_{index + 1}", text="목표 플레이트",
+            f"/fixed_bodies/task_overlay/plate_{index + 1}", text="목표 플레이트",
             position=tuple(goal + np.array([0., 0., .045])),
             font_size_mode="screen", font_screen_scale=.7,
             anchor="center-center",
         ) for index, goal in enumerate(GOALS)]
-        half_x, half_y = map(float, PLATE_HALF_SIZE)
-        vertices = np.array([[-half_x, -half_y, 0.], [half_x, -half_y, 0.],
-                             [half_x, half_y, 0.], [-half_x, half_y, 0.]], dtype=np.float32)
-        faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.uint32)
-        self.fill_markers = [self.server.scene.add_mesh_simple(
-            f"/task_overlay/filled_{index + 1}", vertices=vertices, faces=faces,
-            color=(40, 185, 95), opacity=.35, side="double",
-            position=(float(goal[0]), float(goal[1]), float(PLATE_TOP_Z) + .001), visible=False,
-        ) for index, goal in enumerate(GOALS)]
-        self.target_marker = self.server.scene.add_mesh_simple(
-            "/task_overlay/current_goal", vertices=vertices, faces=faces,
-            color=(40, 150, 245), opacity=.4, side="double",
-            position=(float(GOALS[self.target_cell, 0]),
-                      float(GOALS[self.target_cell, 1]), float(PLATE_TOP_Z) + .0015),
-        )
-        self.goal_labels[self.target_cell].text = "목표 플레이트"
+        # The MuJoCo plate is the only rendered target surface. Labels inherit
+        # mjviser's fixed-body frame so camera tracking moves them with the scene.
         self.scene.camera_tracking_enabled = False
         self.scene.set_refresh_handler(self.refresh_event.set)
         self.scene.create_visualization_gui(
@@ -112,14 +97,14 @@ class LiveSO101Viewer:
             )
             self.server.gui.add_markdown(
                 "**관절 움직임과 집게 개폐를 PPO 정책이 직접 결정합니다.**\n\n"
-                "파란 사각형은 평평한 목표 플레이트, 초록은 공이 안정적으로 안착한 상태입니다. "
+                "갈색 사각형이 실제 목표 플레이트입니다. 안착 여부는 목표 이름과 오른쪽 상태에 표시됩니다. "
                 "공을 실제로 잡아 들어 옮기고, 플레이트 위에 놓아야 성공입니다.\n\n"
                 "정책이 공을 집지 못하거나 불필요하게 움직일 수 있습니다. "
                 "학습 성공 여부는 실제 에피소드 결과로 확인하세요.\n\n"
                 "공과 목표 플레이트의 위치는 화면 에피소드마다 조금씩 바뀝니다. "
                 "최신 가중치는 다음 전체 에피소드 시작 때 반영합니다. "
                 "이 화면의 물리는 CPU에서 별도로 평가하며, 정책 입력 영상은 학습과 같은 GPU 렌더러로 만듭니다. "
-                "3D 화면의 파란·초록 표시는 관찰자를 위한 것이며 정책 영상에는 들어가지 않습니다. "
+                "3D 화면의 목표 이름은 관찰자를 위한 것이며 정책 영상에는 들어가지 않습니다. "
                 "뷰어의 제어 스텝은 학습 업데이트 수와 다르며, "
                 "일시정지와 초기화는 학습에 영향을 주지 않습니다."
             )
@@ -213,12 +198,8 @@ class LiveSO101Viewer:
         self.filled_count = int(info.get("filled_count", int(mask.sum())))
         self.filled_mask = mask.copy()
         goal = np.asarray(info.get("goal_positions", GOALS), dtype=float)[0]
-        self.target_marker.position = (float(goal[0]), float(goal[1]), float(PLATE_TOP_Z) + .0015)
-        self.fill_markers[0].position = (float(goal[0]), float(goal[1]), float(PLATE_TOP_Z) + .001)
         self.goal_labels[0].position = tuple(goal + np.array([0., 0., .045]))
-        self.fill_markers[0].visible = bool(mask[0])
         self.goal_labels[0].text = "플레이트 안착 ✓" if mask[0] else "목표 플레이트"
-        self.target_marker.visible = not bool(mask[0])
 
     def _update_episode_text(self, selection, step, env):
         info = self.last_info

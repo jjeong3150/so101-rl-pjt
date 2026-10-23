@@ -80,7 +80,7 @@ class LiveSO101Viewer:
             camera_distance=1.25, camera_azimuth=130, camera_elevation=30,
         )
         with self.server.gui.add_folder("강화학습과 평가"):
-            self.status_text = self.server.gui.add_markdown("손목 카메라 준비 중 · 3D 초기 자세 표시")
+            self.status_text = self.server.gui.add_markdown("손목·전체 시야 카메라 준비 중 · 3D 초기 자세 표시")
             self.select = self.server.gui.add_dropdown(
                 "표시할 정책", self.MODES, initial_value="최신 정책",
             )
@@ -110,16 +110,16 @@ class LiveSO101Viewer:
             )
         with self.server.gui.add_folder("정책이 보는 영상"):
             self.server.gui.add_markdown(
-                "정책에 실제로 전달한 손목 카메라의 최신 RGB 프레임입니다. "
+                "왼쪽은 손목, 오른쪽은 고정 전체 시야 카메라입니다. 정책에 전달한 최신 RGB 프레임입니다. "
                 "각 영상은 64×64 픽셀이며, 직전·현재 두 프레임과 "
                 "관절 관련 수치 25개로 움직임을 결정합니다. "
                 "영상은 12.5Hz로 갱신합니다. 공의 정확한 좌표는 정책에 전달하지 않습니다."
             )
-            self.policy_images = [self.server.gui.add_image(
-                np.zeros((IMAGE_SHAPE[1], IMAGE_SHAPE[2], 3), dtype=np.uint8),
-                label="손목 카메라",
+            self.policy_image_pair = self.server.gui.add_image(
+                np.zeros((IMAGE_SHAPE[1], IMAGE_SHAPE[2] * len(CAMERA_NAMES), 3), dtype=np.uint8),
+                label="손목 (왼쪽) · 전체 시야 (오른쪽)",
                 format="png",
-            ) for name in CAMERA_NAMES]
+            )
         self.pause.on_update(self._set_pause)
         self.select.on_update(self._set_selection)
         self.reset.on_click(lambda _: self.reset_event.set())
@@ -187,8 +187,9 @@ class LiveSO101Viewer:
         """Display the latest camera frames already supplied to the policy."""
         images = np.asarray(observation["image"], dtype=np.uint8)
         latest = images[-3 * len(CAMERA_NAMES):]
-        for index, handle in enumerate(self.policy_images):
-            handle.image = np.moveaxis(latest[3 * index:3 * (index + 1)], 0, -1).copy()
+        frames = [np.moveaxis(latest[3 * index:3 * (index + 1)], 0, -1)
+                  for index in range(len(CAMERA_NAMES))]
+        self.policy_image_pair.image = np.concatenate(frames, axis=1).copy()
 
     def _update_progress(self, info):
         self.num_balls = int(info.get("num_balls", self.num_balls))

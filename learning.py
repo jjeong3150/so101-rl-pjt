@@ -32,7 +32,7 @@ from environment import (TASK_ID, REWARD_GAMMA, OBSERVATION_DIM, ACTION_DIM,
 
 DEFAULT_CONFIG = {
     "seed": 7,
-    "num_envs": 4,
+    "num_envs": 2,
     "horizon": 64,
     "updates": 1000,
     "epochs": 3,

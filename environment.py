@@ -19,11 +19,15 @@ import warp as wp
 import mujoco_warp as mjw
 
 
-TASK_ID = "so101_one_ball_random_plate_vision_v2"
+TASK_ID = "so101_one_ball_random_plate_dual_vision_v3"
 NUM_BALLS = 1
 ACTION_DIM = 6
 OBSERVATION_DIM = 25
-CAMERA_NAMES = ("wrist_cam",)
+CAMERA_NAMES = ("wrist_cam", "overview_cam")
+# Fixed world camera: diagonal view of the ball, plate and gripper workspace.
+OVERVIEW_CAMERA_POS = (.60, -.45, .60)
+OVERVIEW_CAMERA_LOOKAT = (.23, .0075, .04)
+OVERVIEW_CAMERA_FOVY = 50.
 IMAGE_SIZE = 64
 IMAGE_INTERVAL = 4
 FRAME_STACK = 2
@@ -33,6 +37,9 @@ OBSERVATION_SPEC = {
     "image_shape": list(IMAGE_SHAPE),
     "image_dtype": "uint8",
     "camera_names": list(CAMERA_NAMES),
+    "overview_camera": {"position": list(OVERVIEW_CAMERA_POS),
+                        "lookat": list(OVERVIEW_CAMERA_LOOKAT),
+                        "fovy": OVERVIEW_CAMERA_FOVY, "mode": "fixed"},
     "frame_stack": FRAME_STACK,
     "frame_order": "oldest_to_latest_then_camera_then_rgb",
     "image_interval_control_steps": IMAGE_INTERVAL,
@@ -83,6 +90,16 @@ def _scene_xml(robot_xml):
     root.find("option").attrib.update(timestep=".001", iterations="100",
                                       ls_iterations="50", impratio="100", tolerance="1e-6")
     world = root.find("worldbody")
+    # MuJoCo cameras look along local -Z; local +Y is image up.
+    camera_z = np.asarray(OVERVIEW_CAMERA_POS) - np.asarray(OVERVIEW_CAMERA_LOOKAT)
+    camera_z /= np.linalg.norm(camera_z)
+    camera_x = np.cross(np.array([0., 0., 1.]), camera_z)
+    camera_x /= np.linalg.norm(camera_x)
+    camera_y = np.cross(camera_z, camera_x)
+    ET.SubElement(world, "camera", name="overview_cam", mode="fixed",
+                  pos=" ".join(map(str, OVERVIEW_CAMERA_POS)),
+                  xyaxes=" ".join(map(str, np.concatenate((camera_x, camera_y)))),
+                  fovy=str(OVERVIEW_CAMERA_FOVY))
     ET.SubElement(world, "light", pos=".2 -.2 1.5", dir="0 0 -1")
     ET.SubElement(world, "geom", name="floor", type="plane", size="1 1 .1", rgba=".9 .92 .95 1")
     plate_body = ET.SubElement(world, "body", name="target_plate", mocap="true",

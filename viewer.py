@@ -37,6 +37,8 @@ class LiveSO101Viewer:
         self.runner = runner
         self.bundle = bundle
         self.seed = int(seed)
+        self.episode_index = 0
+        self.layout_seed = self.seed
         self.jitter = float(jitter)
         self.num_balls = int(getattr(bundle, "num_balls", 1))
         self.target_cell = int(TARGET_ORDER[0])
@@ -100,7 +102,7 @@ class LiveSO101Viewer:
             self.pause = self.server.gui.add_checkbox(
                 "뷰어만 일시정지", initial_value=False,
             )
-            self.reset = self.server.gui.add_button("공 1개와 빈 플레이트로 다시 시작")
+            self.reset = self.server.gui.add_button("공·플레이트를 새 위치에서 다시 시작")
             self.episode_text = self.server.gui.add_markdown("물리 시뮬레이션 준비 중")
             self.result_text = self.server.gui.add_markdown("완료된 화면 에피소드 없음")
             self.reward_chart = self.server.gui.add_uplot(
@@ -114,6 +116,7 @@ class LiveSO101Viewer:
                 "공을 실제로 잡아 들어 옮기고, 플레이트 위에 놓아야 성공입니다.\n\n"
                 "정책이 공을 집지 못하거나 불필요하게 움직일 수 있습니다. "
                 "학습 성공 여부는 실제 에피소드 결과로 확인하세요.\n\n"
+                "공과 목표 플레이트의 위치는 화면 에피소드마다 조금씩 바뀝니다. "
                 "최신 가중치는 다음 전체 에피소드 시작 때 반영합니다. "
                 "이 화면의 물리는 CPU에서 별도로 평가하며, 정책 입력 영상은 학습과 같은 GPU 렌더러로 만듭니다. "
                 "3D 화면의 파란·초록 표시는 관찰자를 위한 것이며 정책 영상에는 들어가지 않습니다. "
@@ -183,15 +186,16 @@ class LiveSO101Viewer:
                         if self.episode_policy_version is not None else "무작위 행동")
         self.status_text.content = (
             f"**{self.runner.status}** · {progress}\n\n"
-            f"최근 고정 조건 평가: **{score_text}**\n\n"
+            f"최근 고정 시드 평가: **{score_text}**\n\n"
             f"화면의 공 1개: **{placed_text}** · 목표: **평평한 플레이트**\n\n"
             f"학습 최신 버전: **{getattr(self.runner, 'snapshot_version', 0)}** · "
             f"화면 에피소드 버전: **{version_text}**"
         )
 
-    @staticmethod
-    def _reset(env, seed):
-        result = env.reset(seed=seed)
+    def _reset(self, env, seed):
+        self.layout_seed = int(seed) + self.episode_index
+        self.episode_index += 1
+        result = env.reset(seed=self.layout_seed)
         return result[0] if isinstance(result, tuple) else result
 
     def _update_policy_images(self, observation):
@@ -208,9 +212,10 @@ class LiveSO101Viewer:
         mask = np.asarray(info.get("filled_mask", [False]), dtype=bool).reshape(1)
         self.filled_count = int(info.get("filled_count", int(mask.sum())))
         self.filled_mask = mask.copy()
-        self.target_marker.position = (
-            float(GOALS[0, 0]), float(GOALS[0, 1]), float(PLATE_TOP_Z) + .0015,
-        )
+        goal = np.asarray(info.get("goal_positions", GOALS), dtype=float)[0]
+        self.target_marker.position = (float(goal[0]), float(goal[1]), float(PLATE_TOP_Z) + .0015)
+        self.fill_markers[0].position = (float(goal[0]), float(goal[1]), float(PLATE_TOP_Z) + .001)
+        self.goal_labels[0].position = tuple(goal + np.array([0., 0., .045]))
         self.fill_markers[0].visible = bool(mask[0])
         self.goal_labels[0].text = "플레이트 안착 ✓" if mask[0] else "목표 플레이트"
         self.target_marker.visible = not bool(mask[0])
@@ -310,7 +315,7 @@ class LiveSO101Viewer:
                                     if self.episode_policy_version is not None else "무작위 행동")
                     self.result_text.content = (
                         f"직전 결과: **{result}**\n\n"
-                        f"누적 보상 {total_reward:.2f} · 평가 시드 {self.seed} · "
+                        f"누적 보상 {total_reward:.2f} · 배치 시드 {self.layout_seed} · "
                         f"정책 버전 {version_text}{reason_text}"
                     )
                     terminal_hold_until = begin + 2.

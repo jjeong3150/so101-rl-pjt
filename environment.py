@@ -19,7 +19,7 @@ import warp as wp
 import mujoco_warp as mjw
 
 
-TASK_ID = "so101_one_ball_flat_plate_vision_v1"
+TASK_ID = "so101_one_ball_random_plate_vision_v2"
 NUM_BALLS = 1
 ACTION_DIM = 6
 OBSERVATION_DIM = 25
@@ -51,7 +51,8 @@ BALL_RADIUS = .022
 PLATE_TOP_Z = .005
 PLATE_HALF_SIZE = np.array([.08, .08], dtype=np.float32)
 PLATE_SAFE_HALF_SIZE = PLATE_HALF_SIZE - BALL_RADIUS - .005
-SOURCES = np.array([[.23, -.085, .027]], dtype=np.float32)
+SOURCES = np.array([[.23, -.085, BALL_RADIUS]], dtype=np.float32)
+DEFAULT_PLATE_JITTER = .015
 GOALS = np.array([[.23, .10, PLATE_TOP_Z + BALL_RADIUS]], dtype=np.float32)
 TARGET_ORDER = np.array([0], dtype=np.int64)
 BALL_GOALS = GOALS[TARGET_ORDER]
@@ -69,7 +70,8 @@ ACTION_PENALTY = .001
 ACTION_CHANGE_PENALTY = .002
 THIRD_PARTY_LICENSES = """Robot model: Google DeepMind MuJoCo Menagerie,
 robotstudio_so101, Apache License 2.0. The original model LICENSE is downloaded
-with its assets. The task adds two flat pads and one physical free ball.
+with its assets. The task adds one flat target plate and one physical free ball.
+The source ball rests directly on the floor; the plate moves only at reset.
 No scripted picking controller or trajectory code is included in this module.
 """
 
@@ -83,11 +85,9 @@ def _scene_xml(robot_xml):
     world = root.find("worldbody")
     ET.SubElement(world, "light", pos=".2 -.2 1.5", dir="0 0 -1")
     ET.SubElement(world, "geom", name="floor", type="plane", size="1 1 .1", rgba=".9 .92 .95 1")
-    ET.SubElement(world, "geom", name="source_pad", type="box",
-                  pos=f"{SOURCES[0, 0]} {SOURCES[0, 1]} {PLATE_TOP_Z / 2}",
-                  size=f".06 .06 {PLATE_TOP_Z / 2}", rgba=".10 .40 .32 1")
-    ET.SubElement(world, "geom", name="plate", type="box",
-                  pos=f"{GOALS[0, 0]} {GOALS[0, 1]} {PLATE_TOP_Z / 2}",
+    plate_body = ET.SubElement(world, "body", name="target_plate", mocap="true",
+                               pos=f"{GOALS[0, 0]} {GOALS[0, 1]} {PLATE_TOP_Z / 2}")
+    ET.SubElement(plate_body, "geom", name="plate", type="box", pos="0 0 0",
                   size=f"{PLATE_HALF_SIZE[0]} {PLATE_HALF_SIZE[1]} {PLATE_TOP_Z / 2}",
                   friction="1.5 .02 .002", condim="6", rgba=".77 .68 .48 1")
     body = ET.SubElement(world, "body", name="ball0",
@@ -105,9 +105,13 @@ class SceneBundle:
     num_balls = NUM_BALLS
 
     def __init__(self, asset_dir, max_episode_steps=EPISODE_STEPS,
-                 visual_device=None, camera_names=CAMERA_NAMES):
+                 visual_device=None, camera_names=CAMERA_NAMES,
+                 plate_jitter=DEFAULT_PLATE_JITTER):
         self.asset_dir = Path(asset_dir).resolve()
         self.episode_steps = int(max_episode_steps)
+        self.plate_jitter = float(plate_jitter)
+        if not 0 <= self.plate_jitter <= .03:
+            raise ValueError("plate_jitter must be between 0 and 0.03 metres")
         if self.episode_steps < 1:
             raise ValueError("max_episode_steps must be positive")
         robot_xml = self.asset_dir / "robotstudio_so101" / "so101.xml"
@@ -128,6 +132,7 @@ class SceneBundle:
         self.ball_body_ids = np.array([self.model.body(f"ball{k}").id for k in range(NUM_BALLS)])
         self.ball_geom_ids = np.array([self.model.geom(f"ball{k}").id for k in range(NUM_BALLS)])
         self.plate_geom_id = self.model.geom("plate").id
+        self.plate_mocap_id = int(self.model.body_mocapid[self.model.body("target_plate").id])
         joints = [self.model.joint(f"ball_free{k}").id for k in range(NUM_BALLS)]
         self.ball_qpos_addresses = self.model.jnt_qposadr[joints].astype(int).copy()
         self.ball_dof_addresses = self.model.jnt_dofadr[joints].astype(int).copy()
@@ -142,17 +147,18 @@ class SceneBundle:
         return data.geom_xpos[self.tip_ids].mean(axis=0)
 
 
-def _potential_numpy(balls, aperture, left, right, lifted, released, plate_contacts):
+def _potential_numpy(balls, aperture, left, right, lifted, released, plate_contacts,
+                     goals=BALL_GOALS, sources=SOURCES):
     """Bounded state score; only its discounted change enters the reward."""
     distance = np.linalg.norm(aperture - balls, axis=1)
-    goal_distance = np.linalg.norm(balls - BALL_GOALS, axis=1)
+    goal_distance = np.linalg.norm(balls - goals, axis=1)
     bilateral = left & right
-    height = np.clip((balls[:, 2] - SOURCES[:, 2]) / .06, 0, 1)
-    inside = (np.abs(balls[:, :2] - BALL_GOALS[:, :2]) <= PLATE_SAFE_HALF_SIZE).all(axis=1)
+    height = np.clip((balls[:, 2] - sources[:, 2]) / .06, 0, 1)
+    inside = (np.abs(balls[:, :2] - goals[:, :2]) <= PLATE_SAFE_HALF_SIZE).all(axis=1)
     settled = (lifted & released & inside & plate_contacts & ~left & ~right)
     return (.5 * (1 - np.tanh(10 * distance)) + .5 * bilateral +
             .75 * height * bilateral + 1.5 * lifted * np.exp(-10 * goal_distance) +
-            3 * settled * np.exp(-100 * np.abs(balls[:, 2] - BALL_GOALS[:, 2])) *
+            3 * settled * np.exp(-100 * np.abs(balls[:, 2] - goals[:, 2])) *
             np.clip(distance / .08, 0, 1))
 
 
@@ -179,6 +185,8 @@ class _CameraStack:
                 self.qpos = wp.to_torch(self.data.qpos)
                 self.qvel = wp.to_torch(self.data.qvel)
                 self.ctrl = wp.to_torch(self.data.ctrl)
+                self.mocap_pos = wp.to_torch(self.data.mocap_pos)
+                self.mocap_quat = wp.to_torch(self.data.mocap_quat)
             try:
                 self.context = mjw.create_render_context(
                     bundle.model, nworld=self.num_envs, cam_res=(IMAGE_SIZE, IMAGE_SIZE),
@@ -189,7 +197,7 @@ class _CameraStack:
                 self.close()
                 raise RuntimeError(
                     "Policy RGB rendering could not start. Use the pinned mujoco-warp "
-                    "version and a Colab GPU runtime; image observations cannot be replaced "
+                    "version and an NVIDIA CUDA GPU; image observations cannot be replaced "
                     "with exact simulator object coordinates."
                 ) from exc
             self.rgb_buffers = [wp.zeros((self.num_envs, IMAGE_SIZE, IMAGE_SIZE),
@@ -218,6 +226,8 @@ class _CameraStack:
                 self.qpos.copy_(torch.as_tensor(cpu_data.qpos, device=self.device).unsqueeze(0))
                 self.qvel.copy_(torch.as_tensor(cpu_data.qvel, device=self.device).unsqueeze(0))
                 self.ctrl.copy_(torch.as_tensor(cpu_data.ctrl, device=self.device).unsqueeze(0))
+                self.mocap_pos.copy_(torch.as_tensor(cpu_data.mocap_pos, device=self.device).unsqueeze(0))
+                self.mocap_quat.copy_(torch.as_tensor(cpu_data.mocap_quat, device=self.device).unsqueeze(0))
                 mjw.forward(self.model, self.data)
             # The caller has already forwarded shared training physics.
             mjw.refit_bvh(self.model, self.data, self.context)
@@ -254,6 +264,7 @@ class _CameraStack:
         self.model = self.data = None
         if self.owns_physics:
             self.qpos = self.qvel = self.ctrl = None
+            self.mocap_pos = self.mocap_quat = None
 
 
 class CPUEnv:
@@ -265,6 +276,8 @@ class CPUEnv:
         self.bundle, self.model = bundle, bundle.model
         self.episode_steps = int(max_episode_steps or bundle.episode_steps)
         self.jitter = float(jitter)
+        if not 0 <= self.jitter <= .03:
+            raise ValueError("jitter must be between 0 and 0.03 metres")
         self.rng = np.random.default_rng(seed)
         self.data = mujoco.MjData(self.model)
         self.observation_spec = dict(bundle.observation_spec)
@@ -288,7 +301,7 @@ class CPUEnv:
 
     @property
     def goal(self):
-        return BALL_GOALS[self.active_ball_index]
+        return self.goals[self.active_ball_index]
 
     def reset(self, seed=None):
         if seed is not None:
@@ -297,6 +310,11 @@ class CPUEnv:
         self.data.qpos[:6] = self.bundle.initial_pose
         self.joint_targets = self.bundle.initial_pose.copy()
         self.data.ctrl[:] = self.joint_targets
+        self.goals = BALL_GOALS.copy()
+        self.goals[:, :2] += self.rng.uniform(-self.bundle.plate_jitter, self.bundle.plate_jitter, (NUM_BALLS, 2))
+        plate_position = self.goals[0].copy()
+        plate_position[2] = PLATE_TOP_Z / 2
+        self.data.mocap_pos[self.bundle.plate_mocap_id] = plate_position
         for address, source in zip(self.bundle.ball_qpos_addresses, SOURCES):
             position = source.copy()
             position[:2] += self.rng.uniform(-self.jitter, self.jitter, 2)
@@ -371,7 +389,7 @@ class CPUEnv:
 
     def _info(self):
         balls = self.data.qpos[self.bundle.ball_xyz_indices]
-        errors = np.abs(balls[:, :2] - BALL_GOALS[:, :2]).max(axis=1)
+        errors = np.abs(balls[:, :2] - self.goals[:, :2]).max(axis=1)
         grid = np.zeros(NUM_BALLS, dtype=bool)
         grid[TARGET_ORDER] = self.filled
         return {
@@ -381,6 +399,7 @@ class CPUEnv:
             "filled_by_ball": self.filled.tolist(), "remaining_balls": int(NUM_BALLS - self.filled.sum()),
             "all_target_errors": errors.tolist(), "target_error": float(errors[self.active_ball_index]),
             "ball_positions": balls.tolist(), "max_heights": self.max_heights.tolist(),
+            "goal_positions": self.goals.tolist(), "plate_jitter_m": self.bundle.plate_jitter,
             "all_lifted": self.lifted.tolist(), "all_released": self.released.tolist(),
             "all_bilateral_seen": self.bilateral_seen.tolist(),
             "stable_steps": self.stable_steps.tolist(), "success": bool(self.success),
@@ -402,7 +421,7 @@ class CPUEnv:
         before = _potential_numpy(self.data.qpos[self.bundle.ball_xyz_indices],
                                    self.bundle.aperture(self.data), self.left_contacts,
                                    self.right_contacts, self.lifted, self.released,
-                                   self.plate_contacts)[active]
+                                   self.plate_contacts, goals=self.goals)[active]
         old_lifted = self.lifted.copy()
         action = np.tanh(raw)
         action_change = action - self.previous_action
@@ -416,7 +435,7 @@ class CPUEnv:
         velocities = self.data.qvel[self.bundle.ball_velocity_indices]
         distance = np.linalg.norm(self.bundle.aperture(self.data) - balls, axis=1)
         speed = np.linalg.norm(velocities, axis=1)
-        inside = (np.abs(balls[:, :2] - BALL_GOALS[:, :2]) <= PLATE_SAFE_HALF_SIZE).all(axis=1)
+        inside = (np.abs(balls[:, :2] - self.goals[:, :2]) <= PLATE_SAFE_HALF_SIZE).all(axis=1)
         left, right, plate = self._jaw_contacts()
         self.left_contacts, self.right_contacts, self.plate_contacts = left, right, plate
         self.bilateral_seen |= left & right
@@ -426,7 +445,7 @@ class CPUEnv:
         self.lifted |= self.lift_steps >= LIFT_STEPS
         self.released |= self.lifted & (self.data.qpos[5] > .6) & ~left & ~right & (distance > .045)
         stable = (self.lifted & self.bilateral_seen & self.released & inside & plate &
-                  (np.abs(balls[:, 2] - BALL_GOALS[:, 2]) <= PLACE_Z_TOLERANCE) &
+                  (np.abs(balls[:, 2] - self.goals[:, 2]) <= PLACE_Z_TOLERANCE) &
                   (speed < PLACE_SPEED_LIMIT) & ~left & ~right & (distance > .06))
         self.stable_steps = np.where(stable, self.stable_steps + 1, 0)
         self.filled = self.stable_steps >= STABLE_STEPS
@@ -440,7 +459,7 @@ class CPUEnv:
         # from the physical successor and therefore retain its potential.
         after = 0. if terminated else _potential_numpy(
             balls, self.bundle.aperture(self.data), left, right, self.lifted,
-            self.released, plate)[active]
+            self.released, plate, goals=self.goals)[active]
         self.reward_components = {
             "progress": float(SHAPING_SCALE * (REWARD_GAMMA * after - before)),
             "first_lift": float(FIRST_LIFT_REWARD * (self.lifted & ~old_lifted).sum()),
@@ -535,13 +554,18 @@ class WarpEnv:
         self.stream = (wp.stream_from_torch(torch.cuda.current_stream(self.device))
                        if self.device.type == "cuda" else None)
         self.jitter, self.graph = float(jitter), None
+        if not 0 <= self.jitter <= .03:
+            raise ValueError("jitter must be between 0 and 0.03 metres")
         with self.scope():
             self.model = mjw.put_model(bundle.model)
             self.data = mjw.make_data(bundle.model, nworld=self.num_envs, nconmax=192, njmax=600)
             self.qpos, self.qvel, self.ctrl = [wp.to_torch(getattr(self.data, key)) for key in ("qpos", "qvel", "ctrl")]
             self.geom_xpos = wp.to_torch(self.data.geom_xpos)
             self.sources = torch.as_tensor(SOURCES, dtype=torch.float32, device=self.device)
-            self.goals = torch.as_tensor(BALL_GOALS, dtype=torch.float32, device=self.device)
+            self.base_goals = torch.as_tensor(BALL_GOALS, dtype=torch.float32, device=self.device)
+            self.goals = self.base_goals.expand(self.num_envs, NUM_BALLS, 3).clone()
+            self.mocap_pos = wp.to_torch(self.data.mocap_pos)
+            self.mocap_quat = wp.to_torch(self.data.mocap_quat)
             self.safe_half_size = torch.as_tensor(PLATE_SAFE_HALF_SIZE, device=self.device)
             self.scale = torch.as_tensor(ACTION_SCALE, device=self.device)
             self.lower, self.upper = [torch.as_tensor(v, dtype=torch.float32, device=self.device)
@@ -608,6 +632,14 @@ class WarpEnv:
         self.qpos[:, :6].copy_(torch.where(mask[:, None], arm, self.qpos[:, :6]))
         self.joint_targets.copy_(torch.where(mask[:, None], arm, self.joint_targets))
         self.ctrl.copy_(torch.where(mask[:, None], arm, self.ctrl))
+        goals = self.base_goals.expand(self.num_envs, NUM_BALLS, 3).clone()
+        goals[:, :, :2] += self.bundle.plate_jitter * (2 * torch.rand(
+            (self.num_envs, NUM_BALLS, 2), device=self.device, generator=self.generator) - 1)
+        self.goals.copy_(torch.where(mask[:, None, None], goals, self.goals))
+        plate_positions = self.goals[:, 0].clone()
+        plate_positions[:, 2] = PLATE_TOP_Z / 2
+        mocap_index = self.bundle.plate_mocap_id
+        self.mocap_pos[:, mocap_index] = torch.where(mask[:, None], plate_positions, self.mocap_pos[:, mocap_index])
         positions = self.sources.expand(self.num_envs, NUM_BALLS, 3).clone()
         positions[:, :, :2] += self.jitter * (2 * torch.rand(
             (self.num_envs, NUM_BALLS, 2), device=self.device, generator=self.generator) - 1)
@@ -681,12 +713,12 @@ class WarpEnv:
         goal_distance = (balls - self.goals).norm(dim=2)
         bilateral = self.left_contacts & self.right_contacts
         height = ((balls[:, :, 2] - self.sources[:, 2]) / .06).clamp(0, 1)
-        inside = ((balls[:, :, :2] - self.goals[:, :2]).abs() <= self.safe_half_size).all(dim=2)
+        inside = ((balls[:, :, :2] - self.goals[..., :2]).abs() <= self.safe_half_size).all(dim=2)
         settled = (self.lifted & self.released & inside & self.plate_contacts &
                    ~self.left_contacts & ~self.right_contacts)
         return (.5 * (1 - torch.tanh(10 * distance)) + .5 * bilateral +
                 .75 * height * bilateral + 1.5 * self.lifted * torch.exp(-10 * goal_distance) +
-                3 * settled * torch.exp(-100 * (balls[:, :, 2] - self.goals[:, 2]).abs()) *
+                3 * settled * torch.exp(-100 * (balls[:, :, 2] - self.goals[..., 2]).abs()) *
                 (distance / .08).clamp(0, 1))
 
     def _jaw_contacts(self):
@@ -737,8 +769,8 @@ class WarpEnv:
             balls, velocities = self._balls(), self._velocities()
             distance = (self._eef()[:, None, :] - balls).norm(dim=2)
             speed = velocities.norm(dim=2)
-            errors = (balls[:, :, :2] - self.goals[:, :2]).abs().amax(dim=2)
-            inside = ((balls[:, :, :2] - self.goals[:, :2]).abs() <= self.safe_half_size).all(dim=2)
+            errors = (balls[:, :, :2] - self.goals[..., :2]).abs().amax(dim=2)
+            inside = ((balls[:, :, :2] - self.goals[..., :2]).abs() <= self.safe_half_size).all(dim=2)
             left, right, plate = self._jaw_contacts()
             self.left_contacts.copy_(left)
             self.right_contacts.copy_(right)
@@ -751,7 +783,7 @@ class WarpEnv:
             self.released.logical_or_(self.lifted & (self.qpos[:, 5:6] > .6) &
                                       ~left & ~right & (distance > .045))
             stable = (self.lifted & self.bilateral_seen & self.released & inside & plate &
-                      ((balls[:, :, 2] - self.goals[:, 2]).abs() <= PLACE_Z_TOLERANCE) &
+                      ((balls[:, :, 2] - self.goals[..., 2]).abs() <= PLACE_Z_TOLERANCE) &
                       (speed < PLACE_SPEED_LIMIT) & ~left & ~right & (distance > .06))
             self.stable_steps.copy_(torch.where(stable, self.stable_steps + 1, 0))
             self.filled.copy_(self.stable_steps >= STABLE_STEPS)
@@ -797,7 +829,7 @@ class WarpEnv:
                 "filled_count": filled_count.clone(), "filled_mask": grid.clone(),
                 "active_ball_index": active.clone(), "target_cell": self.grid_order[active],
                 "reward_components": {key: value.clone() for key, value in reward_components.items()},
-                "task_id": TASK_ID,
+                "task_id": TASK_ID, "goal_positions": self.goals.clone(),
             }
             if bool(done.any()):
                 self._reset(done)

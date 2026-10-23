@@ -1,7 +1,9 @@
-"""PPO whose policy chooses every joint target increment and gripper action.
+"""Camera-based CNN PPO chooses every joint target increment and gripper action.
 
 The environment integrates tanh(raw_action) * joint_increment_scale into its
-joint targets. There is no nominal movement path, scheduled grasp sequence,
+joint targets. The actor and critic receive RGB camera frame stacks and joint
+proprioception. Exact object poses and contact/reward flags stay in the
+environment for physics and scoring. There is no nominal movement path, scheduled grasp sequence,
 or learned correction around a separate task controller in this module.
 Source authored for a Colab notebook; it has not been executed or validated.
 """
@@ -24,16 +26,17 @@ import torch
 from torch import nn
 from torch.distributions import Normal
 
-from environment import TASK_ID, REWARD_GAMMA, OBSERVATION_DIM, ACTION_DIM
+from environment import (TASK_ID, REWARD_GAMMA, OBSERVATION_DIM, ACTION_DIM,
+                         IMAGE_SHAPE, OBSERVATION_SPEC)
 
 
 DEFAULT_CONFIG = {
     "seed": 7,
-    "num_envs": 8,
-    "horizon": 128,
+    "num_envs": 4,
+    "horizon": 64,
     "updates": 1000,
     "epochs": 3,
-    "minibatch_size": 256,
+    "minibatch_size": 128,
     "learning_rate": 3e-4,
     "gamma": REWARD_GAMMA,
     "gae_lambda": 0.95,
@@ -55,7 +58,9 @@ ATTRIBUTION = {
     "method": "direct joint-target-increment PPO",
     "action_semantics": "six raw Normal actions mapped by environment tanh to joint-target increments",
     "movement_source": "all joint and gripper movement commands are selected by the policy",
-    "policy_observations": "privileged simulator state; no image encoder",
+    "policy_observations": "RGB camera frame stacks plus joint proprioception; no privileged state in actor or critic",
+    "policy_type": "cnn_rgb_proprio_ppo_v1",
+    "observation_spec": OBSERVATION_SPEC,
     "episode_metrics": "success refers to one physically grasped, lifted and released ball resting on the flat plate",
     "task_id": TASK_ID,
     "algorithm_reference": "https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/ppo_continuous_action.py",
@@ -63,48 +68,107 @@ ATTRIBUTION = {
 }
 
 
-class ActorCritic(nn.Module):
-    """Two small MLPs with a Normal distribution over raw action latents."""
+POLICY_TYPE = "cnn_rgb_proprio_ppo_v1"
+POLICY_ARCHITECTURE = {
+    "encoder": "Conv16(k8,s4)-Conv32(k4,s2)-Conv32(k3,s1)-FC128",
+    "fusion": "RGB features plus joint proprioception -> FC64",
+    "actor": "FC64-Tanh-FC6 Normal mean",
+    "critic": "FC64-Tanh-FC1",
+    "pixel_normalization": "uint8 to float32 divided by 255 inside the encoder",
+    "privileged_critic": False,
+}
 
-    def __init__(self, observation_dim, action_dim=6, hidden_dim=64):
+
+def batch_observation(observation, device="cpu"):
+    """Add a batch dimension to one CPU environment observation for inference."""
+    if not isinstance(observation, dict) or set(observation) != {"image", "proprio"}:
+        raise ValueError("Expected an observation dictionary with image and proprio.")
+    image = torch.as_tensor(observation["image"], device=device)
+    proprio = torch.as_tensor(observation["proprio"], dtype=torch.float32, device=device)
+    if image.dtype != torch.uint8 or tuple(image.shape) != tuple(IMAGE_SHAPE):
+        raise ValueError("The single-environment camera pixel shape or dtype does not match.")
+    if tuple(proprio.shape) != (OBSERVATION_DIM,):
+        raise ValueError("The single-environment proprioception shape does not match.")
+    _require_finite("proprioception", proprio)
+    return {"image": image.unsqueeze(0), "proprio": proprio.unsqueeze(0)}
+
+
+def _select_observation(observation, index):
+    return {key: value[index] for key, value in observation.items()}
+
+
+class ActorCritic(nn.Module):
+    """Image-based PPO actor and critic with joint proprioception.
+
+    Both heads consume the same image encoder. Neither head receives exact
+    ball, plate, end-effector positions or simulator contact/reward flags.
+    """
+
+    def __init__(self, observation_dim=OBSERVATION_DIM, action_dim=ACTION_DIM,
+                 hidden_dim=64, image_shape=IMAGE_SHAPE):
         super().__init__()
         self.observation_dim = self.obs_dim = int(observation_dim)
         self.action_dim, self.hidden_dim = int(action_dim), int(hidden_dim)
+        self.image_shape = tuple(int(value) for value in image_shape)
+        if self.observation_dim != OBSERVATION_DIM or self.image_shape != tuple(IMAGE_SHAPE):
+            raise ValueError("The vision policy must match the environment observation specification.")
+        channels, height, width = self.image_shape
+        if (height, width) != (64, 64):
+            raise ValueError("This compact CNN expects 64 by 64 camera frames.")
+        self.encoder = nn.Sequential(
+            nn.Conv2d(channels, 16, kernel_size=8, stride=4), nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=4, stride=2), nn.ReLU(),
+            nn.Conv2d(32, 32, kernel_size=3, stride=1), nn.ReLU(),
+            nn.Flatten(), nn.Linear(32 * 4 * 4, 128), nn.ReLU(),
+        )
+        self.fusion = nn.Sequential(
+            nn.Linear(128 + self.observation_dim, self.hidden_dim), nn.Tanh(),
+        )
         self.actor = nn.Sequential(
-            nn.Linear(self.observation_dim, self.hidden_dim), nn.Tanh(),
             nn.Linear(self.hidden_dim, self.hidden_dim), nn.Tanh(),
             nn.Linear(self.hidden_dim, self.action_dim),
         )
         self.critic = nn.Sequential(
-            nn.Linear(self.observation_dim, self.hidden_dim), nn.Tanh(),
             nn.Linear(self.hidden_dim, self.hidden_dim), nn.Tanh(),
             nn.Linear(self.hidden_dim, 1),
         )
         self.log_std = nn.Parameter(torch.full((self.action_dim,), -0.3))
         for layer in self.modules():
-            if isinstance(layer, nn.Linear):
+            if isinstance(layer, (nn.Conv2d, nn.Linear)):
                 nn.init.orthogonal_(layer.weight, math.sqrt(2))
                 nn.init.zeros_(layer.bias)
         nn.init.orthogonal_(self.actor[-1].weight, .01)
         nn.init.orthogonal_(self.critic[-1].weight, 1.)
 
+    def _features(self, observation):
+        image = observation["image"]
+        proprio = observation["proprio"]
+        if image.dtype != torch.uint8:
+            raise TypeError("Camera observations must be uint8 pixels, not simulator state.")
+        pixels = image.to(dtype=torch.float32).div(255.)
+        visual = self.encoder(pixels)
+        return self.fusion(torch.cat((visual, proprio), dim=-1))
+
     def forward(self, observation):
-        return self.actor(observation)
+        return self.mean_action(observation)
 
     def act(self, observation, action=None, deterministic=False):
-        mean = self.actor(observation)
+        features = self._features(observation)
+        mean = self.actor(features)
         distribution = Normal(mean, self.log_std.clamp(-4., 1.).exp().expand_as(mean))
         if action is None:
             action = mean if deterministic else distribution.sample()
-        # The exact raw action is stored. Tanh belongs to the environment,
-        # so the PPO ratio is computed under the same raw Normal distribution.
+        # Store the exact raw Normal action; the environment applies tanh.
         return (action, distribution.log_prob(action).sum(-1),
-                distribution.entropy().sum(-1), self.critic(observation).squeeze(-1))
+                distribution.entropy().sum(-1), self.critic(features).squeeze(-1))
 
     def mean_action(self, observation):
-        return self.actor(observation)
+        return self.actor(self._features(observation))
 
     deterministic_action = mean_action
+
+    def value(self, observation):
+        return self.critic(self._features(observation)).squeeze(-1)
 
 
 def compute_gae(rewards, dones, values, next_value, gamma=.995, gae_lambda=.95):
@@ -161,7 +225,7 @@ class PPORunner:
     make_env() runs inside the learner thread so the MJWarp environment can
     adopt that thread's current CUDA stream. Its step() returns observations,
     reward, terminated, truncated and info. info contains a whole-batch
-    final_obs before autoreset plus completed-only episode_returns,
+    final_obs dictionary before autoreset plus completed-only episode_returns,
     episode_success and optional episode_filled_count arrays.
 
     evaluator(cpu_policy, mode='learned'|'random', seed=...) is optional.
@@ -180,9 +244,12 @@ class PPORunner:
         self.device = torch.device(device)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.metadata = _json_safe({**dict(metadata or {}), "task_id": TASK_ID})
+        self.metadata = _json_safe({**dict(metadata or {}), "task_id": TASK_ID,
+                                    "policy_type": POLICY_TYPE,
+                                    "observation_spec": OBSERVATION_SPEC,
+                                    "architecture": POLICY_ARCHITECTURE})
         self.versions = _versions()
-        self.observation_dim = observation_dim or self.config.get("observation_dim")
+        self.observation_dim = observation_dim or self.config.get("observation_dim", OBSERVATION_DIM)
         self.action_dim = int(action_dim)
         self.lock = threading.RLock()
         self._save_lock = threading.Lock()
@@ -216,6 +283,8 @@ class PPORunner:
             raise ValueError(f"gamma must match the reward potential discount ({REWARD_GAMMA}).")
 
     def _initialize_policy(self, observation_dim, action_dim):
+        if (int(observation_dim), int(action_dim)) != (OBSERVATION_DIM, ACTION_DIM):
+            raise ValueError("Vision policy dimensions must match the current environment.")
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(self.config["seed"])
             self.policy = ActorCritic(observation_dim, action_dim)
@@ -238,20 +307,26 @@ class PPORunner:
             return copy.deepcopy(weights), version
 
     def load_checkpoint(self, path, restore_optimizer=True):
-        """Warm-start this fresh runner from a checkpoint written by this file."""
+        """Warm-start a compatible camera policy; scalar-state policies cannot be reused."""
         if self._training or self.thread is not None:
             raise RuntimeError("Load a checkpoint before start().")
         payload = torch.load(path, map_location="cpu", weights_only=True)
-        if payload.get("task_id") != TASK_ID:
+        if payload.get("format_version") != 4 or payload.get("policy_type") != POLICY_TYPE:
             raise ValueError(
-                "Checkpoint task does not match the one-ball flat-plate task. "
-                "Six-ball grid checkpoints cannot be resumed; start a new policy."
+                "This notebook requires a format-4 RGB-camera CNN checkpoint. "
+                "Older numeric-state or six-ball checkpoints are incompatible; start a new policy."
             )
+        if payload.get("task_id") != TASK_ID:
+            raise ValueError("Checkpoint task does not match the camera-based one-ball flat-plate task.")
+        if _json_safe(payload.get("observation_spec")) != _json_safe(OBSERVATION_SPEC):
+            raise ValueError("Checkpoint camera names, frame stack, image timing or proprioception differ.")
+        if payload.get("architecture") != POLICY_ARCHITECTURE:
+            raise ValueError("Checkpoint vision architecture does not match this policy.")
         if payload.get("action_semantics") != ATTRIBUTION["action_semantics"]:
             raise ValueError("This is not a direct joint-increment checkpoint from this notebook.")
         obs_dim, act_dim = int(payload["observation_dim"]), int(payload["action_dim"])
         if (obs_dim, act_dim) != (OBSERVATION_DIM, ACTION_DIM):
-            raise ValueError("Checkpoint dimensions do not match the current one-ball environment.")
+            raise ValueError("Checkpoint dimensions do not match the current vision environment.")
         if self.observation_dim is not None and (obs_dim, act_dim) != (self.observation_dim, self.action_dim):
             raise ValueError("Checkpoint and environment dimensions differ.")
         if self.policy is None:
@@ -267,7 +342,7 @@ class PPORunner:
             self._pending_optimizer = payload.get("optimizer") if restore_optimizer else None
             self.warm_start = {"path": str(path), "optimizer_requested": bool(restore_optimizer),
                                "previous_updates": self.completed_updates, "previous_steps": self.total_steps,
-                               "scope": "policy and optional optimizer; simulator, rollout and RNG restart"}
+                               "scope": "vision policy and optional optimizer; simulator, rollout and RNG restart"}
             self.status = "저장된 정책 불러옴"
         return self
 
@@ -312,11 +387,18 @@ class PPORunner:
             print(self.error)
 
     def _observation(self, value, count):
-        value = torch.as_tensor(value, dtype=torch.float32, device=self.device)
-        if tuple(value.shape) != (count, self.observation_dim):
-            raise ValueError("The environment observation shape does not match the policy.")
-        _require_finite("observation", value)
-        return value
+        if not isinstance(value, dict) or set(value) != {"image", "proprio"}:
+            raise ValueError("Vision observations must contain exactly image and proprio.")
+        image = torch.as_tensor(value["image"], device=self.device)
+        proprio = torch.as_tensor(value["proprio"], dtype=torch.float32, device=self.device)
+        if image.dtype != torch.uint8:
+            raise TypeError("Camera pixels must be uint8 to preserve the rollout memory budget.")
+        if tuple(image.shape) != (count, *IMAGE_SHAPE):
+            raise ValueError("The batched camera frame stack shape does not match the policy.")
+        if tuple(proprio.shape) != (count, self.observation_dim):
+            raise ValueError("The batched proprioception shape does not match the policy.")
+        _require_finite("proprioception", proprio)
+        return {"image": image, "proprio": proprio}
 
     def _evaluate(self, update, initial=False):
         if self.evaluator is None:
@@ -376,7 +458,10 @@ class PPORunner:
                 self._evaluate(self.completed_updates, initial=True)
             self.save("before_training.pt", initial=True)
             horizon, batch_size = cfg["horizon"], cfg["horizon"] * nenv
-            obs_buf = torch.empty((horizon, nenv, self.observation_dim), device=self.device)
+            obs_buf = {
+                "image": torch.empty((horizon, nenv, *IMAGE_SHAPE), dtype=torch.uint8, device=self.device),
+                "proprio": torch.empty((horizon, nenv, self.observation_dim), device=self.device),
+            }
             action_buf = torch.empty((horizon, nenv, self.action_dim), device=self.device)
             log_buf = torch.empty((horizon, nenv), device=self.device)
             rewards, values = torch.empty_like(log_buf), torch.empty_like(log_buf)
@@ -394,7 +479,8 @@ class PPORunner:
                     if self.stop_event.is_set():
                         partial = True
                         break
-                    obs_buf[step].copy_(obs)
+                    for key in obs_buf:
+                        obs_buf[key][step].copy_(obs[key])
                     with torch.no_grad():
                         action, log_prob, _, value = self.policy.act(obs)
                         _require_finite("sampled action", action)
@@ -408,7 +494,7 @@ class PPORunner:
                         if bool(timeout.any()):
                             final_obs = self._observation(info["final_obs"], nenv)
                             reward = reward.clone()
-                            reward[timeout] += cfg["gamma"] * self.policy.critic(final_obs[timeout]).squeeze(-1)
+                            reward[timeout] += cfg["gamma"] * self.policy.value(_select_observation(final_obs, timeout))
                     action_buf[step].copy_(action)
                     log_buf[step].copy_(log_prob)
                     values[step].copy_(value)
@@ -440,10 +526,14 @@ class PPORunner:
                 if partial:
                     break
                 with torch.no_grad():
-                    next_value = self.policy.critic(obs).squeeze(-1)
+                    next_value = self.policy.value(obs)
                     advantages, returns = compute_gae(rewards, dones, values, next_value, cfg["gamma"], cfg["gae_lambda"])
                     _require_finite("advantages", advantages)
-                b_obs, b_actions = obs_buf.reshape(-1, self.observation_dim), action_buf.reshape(-1, self.action_dim)
+                b_obs = {
+                    "image": obs_buf["image"].reshape(-1, *IMAGE_SHAPE),
+                    "proprio": obs_buf["proprio"].reshape(-1, self.observation_dim),
+                }
+                b_actions = action_buf.reshape(-1, self.action_dim)
                 b_log_prob, b_returns, b_adv = log_buf.flatten(), returns.flatten(), advantages.flatten()
                 b_adv = (b_adv - b_adv.mean()) / (b_adv.std(unbiased=False) + 1e-8)
                 if cfg["anneal_lr"]:
@@ -454,7 +544,7 @@ class PPORunner:
                     permutation = torch.randperm(batch_size, device=self.device)
                     for start in range(0, batch_size, cfg["minibatch_size"]):
                         idx = permutation[start:start + cfg["minibatch_size"]]
-                        _, log_prob, entropy, value = self.policy.act(b_obs[idx], b_actions[idx])
+                        _, log_prob, entropy, value = self.policy.act(_select_observation(b_obs, idx), b_actions[idx])
                         log_ratio = log_prob - b_log_prob[idx]
                         ratio = log_ratio.exp()
                         policy_loss = torch.maximum(-b_adv[idx] * ratio,
@@ -518,13 +608,16 @@ class PPORunner:
             with self.lock:
                 history, evaluations = copy.deepcopy(self.history), copy.deepcopy(self.evaluations)
                 payload = {
-                    "format_version": 3, "task_id": TASK_ID,
+                    "format_version": 4, "task_id": TASK_ID,
+                    "policy_type": POLICY_TYPE,
+                    "observation_spec": _json_safe(OBSERVATION_SPEC),
+                    "architecture": copy.deepcopy(POLICY_ARCHITECTURE),
                     "action_semantics": ATTRIBUTION["action_semantics"],
                     "policy": weights,
                     "optimizer": copy.deepcopy(self.optimizer.state_dict()) if self.optimizer is not None and not initial else None,
                     "initial_policy": copy.deepcopy(self.initial_weights),
                     "observation_dim": self.observation_dim, "action_dim": self.action_dim,
-                    "hidden_dim": 64, "config": _json_safe(self.config),
+                    "hidden_dim": 64, "image_shape": list(IMAGE_SHAPE), "config": _json_safe(self.config),
                     "snapshot_version": version, "training_updates": self.completed_updates,
                     "steps": self.total_steps, "status": self.status,
                     "baseline": copy.deepcopy(self.baseline), "final_evaluation": copy.deepcopy(self.final_evaluation),
@@ -540,7 +633,10 @@ class PPORunner:
             for name, value in (("config.json", payload["config"]), ("history.json", history),
                                 ("evaluations.json", evaluations),
                                 ("provenance.json", {"attribution": ATTRIBUTION, "metadata": self.metadata,
-                                                     "versions": self.versions, "warm_start": self.warm_start})):
+                                                     "versions": self.versions, "warm_start": self.warm_start,
+                                                     "policy_type": POLICY_TYPE,
+                                                     "observation_spec": OBSERVATION_SPEC,
+                                                     "architecture": POLICY_ARCHITECTURE})): 
                 destination = self.output_dir / name
                 pending = destination.with_suffix(destination.suffix + ".tmp")
                 pending.write_text(json.dumps(_json_safe(value), indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8")

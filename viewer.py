@@ -1,4 +1,6 @@
-"""Browser visualization of an independent direct-policy CPU rollout.
+"""Browser visualization of an independent visual-policy rollout.
+
+MuJoCo physics runs on CPU; policy cameras use the same GPU renderer as training.
 
 The RL policy chooses all arm-joint and gripper target increments. This viewer
 does not contain a trajectory, an inverse-kinematics planner, or a scripted pick.
@@ -13,12 +15,13 @@ import traceback
 import numpy as np
 import torch
 
-from environment import CPUEnv, GOALS, TARGET_ORDER, PLATE_HALF_SIZE, PLATE_TOP_Z
-from learning import ActorCritic
+from environment import (CPUEnv, GOALS, TARGET_ORDER, PLATE_HALF_SIZE, PLATE_TOP_Z,
+                         CAMERA_NAMES, IMAGE_SHAPE)
+from learning import ActorCritic, batch_observation
 
 
 class LiveSO101Viewer:
-    """Show one CPU policy rollout with 50 Hz control and 15 fps visualization.
+    """Show one visual-policy rollout with CPU physics and GPU camera rendering.
 
     Only the worker thread owns its MuJoCo data. GUI callbacks communicate
     through events; copied network weights stay fixed for a whole episode.
@@ -26,7 +29,7 @@ class LiveSO101Viewer:
 
     MODES = ("학습 시작 시 정책", "최신 정책", "무작위 행동")
 
-    def __init__(self, runner, bundle, port=8081, seed=2026, jitter=.002):
+    def __init__(self, runner, bundle, port=8081, seed=2026, jitter=.015):
         import viser
         from mjviser import ViserMujocoScene
 
@@ -103,9 +106,23 @@ class LiveSO101Viewer:
                 "정책이 공을 집지 못하거나 불필요하게 움직일 수 있습니다. "
                 "학습 성공 여부는 실제 에피소드 결과로 확인하세요.\n\n"
                 "최신 가중치는 다음 전체 에피소드 시작 때 반영합니다. "
-                "이 화면은 GPU 학습과 별개인 CPU 평가입니다. 뷰어의 제어 스텝은 학습 업데이트 수와 다르며, "
+                "이 화면의 물리는 CPU에서 별도로 평가하며, 정책 입력 영상은 학습과 같은 GPU 렌더러로 만듭니다. "
+                "3D 화면의 파란·초록 표시는 관찰자를 위한 것이며 정책 영상에는 들어가지 않습니다. "
+                "뷰어의 제어 스텝은 학습 업데이트 수와 다르며, "
                 "일시정지와 초기화는 학습에 영향을 주지 않습니다."
             )
+        with self.server.gui.add_folder("정책이 보는 영상"):
+            self.server.gui.add_markdown(
+                "정책에 실제로 전달한 두 카메라의 최신 RGB 프레임입니다. "
+                "각 영상은 64×64 픽셀이며, 직전·현재 두 프레임과 "
+                "관절 관련 수치 25개로 움직임을 결정합니다. "
+                "영상은 12.5Hz로 갱신합니다. 공의 정확한 좌표는 정책에 전달하지 않습니다."
+            )
+            self.policy_images = [self.server.gui.add_image(
+                np.zeros((IMAGE_SHAPE[1], IMAGE_SHAPE[2], 3), dtype=np.uint8),
+                label=("손목 카메라" if name == "wrist_cam" else "고정 카메라"),
+                format="png",
+            ) for name in CAMERA_NAMES]
         self.pause.on_update(self._set_pause)
         self.select.on_update(self._set_selection)
         self.reset.on_click(lambda _: self.reset_event.set())
@@ -166,7 +183,14 @@ class LiveSO101Viewer:
     @staticmethod
     def _reset(env, seed):
         result = env.reset(seed=seed)
-        return np.asarray(result[0] if isinstance(result, tuple) else result, dtype=np.float32)
+        return result[0] if isinstance(result, tuple) else result
+
+    def _update_policy_images(self, observation):
+        """Display the latest camera frames already supplied to the policy."""
+        images = np.asarray(observation["image"], dtype=np.uint8)
+        latest = images[-3 * len(CAMERA_NAMES):]
+        for index, handle in enumerate(self.policy_images):
+            handle.image = np.moveaxis(latest[3 * index:3 * (index + 1)], 0, -1).copy()
 
     def _update_progress(self, info):
         self.num_balls = int(info.get("num_balls", self.num_balls))
@@ -200,6 +224,12 @@ class LiveSO101Viewer:
 
     def _loop(self):
         env = CPUEnv(self.bundle, seed=self.seed, jitter=self.jitter)
+        try:
+            self._run_rollout(env)
+        finally:
+            env.close()
+
+    def _run_rollout(self, env):
         self.data = env.data
         policy = ActorCritic(env.observation_dim, env.action_dim).cpu().eval()
         obs = self._reset(env, self.seed)
@@ -255,9 +285,8 @@ class LiveSO101Viewer:
                     action = rng.standard_normal(env.action_dim).astype(np.float32)
                 else:
                     with torch.inference_mode():
-                        action = policy.actor(torch.from_numpy(obs).unsqueeze(0)).squeeze(0).numpy()
+                        action = policy.mean_action(batch_observation(obs, device="cpu")).squeeze(0).numpy()
                 obs, reward, terminated, truncated, info = env.step(action)
-                obs = np.asarray(obs, dtype=np.float32)
                 step += 1
                 total_reward += float(reward)
                 self.last_info = dict(info)
@@ -279,6 +308,7 @@ class LiveSO101Viewer:
                     self.refresh_event.set()
             if self.refresh_event.is_set() or begin - last_render >= 1. / 15.:
                 self.scene.update_from_mjdata(env.data)
+                self._update_policy_images(obs)
                 self.refresh_event.clear()
                 last_render = begin
             if begin - last_status >= .5:

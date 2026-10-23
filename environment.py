@@ -3,6 +3,8 @@
 The policy chooses incremental targets for all six actuators. There is no
 scripted approach, grasp trajectory, inverse-kinematics planner or timed motion
 phase. Fixed initial poses are applied only when an entire episode is reset.
+Both actor and critic observe camera RGB and robot proprioception only; exact
+object positions and contact flags remain internal to reward and diagnostics.
 """
 from __future__ import annotations
 
@@ -17,10 +19,27 @@ import warp as wp
 import mujoco_warp as mjw
 
 
-TASK_ID = "so101_one_ball_flat_plate_v1"
+TASK_ID = "so101_one_ball_flat_plate_vision_v1"
 NUM_BALLS = 1
 ACTION_DIM = 6
-OBSERVATION_DIM = 47
+OBSERVATION_DIM = 25
+CAMERA_NAMES = ("wrist_cam", "overview_cam")
+IMAGE_SIZE = 64
+IMAGE_INTERVAL = 4
+FRAME_STACK = 2
+IMAGE_SHAPE = (FRAME_STACK * len(CAMERA_NAMES) * 3, IMAGE_SIZE, IMAGE_SIZE)
+OBSERVATION_SPEC = {
+    "mode": "rgb_and_proprioception",
+    "image_shape": list(IMAGE_SHAPE),
+    "image_dtype": "uint8",
+    "camera_names": list(CAMERA_NAMES),
+    "frame_stack": FRAME_STACK,
+    "frame_order": "oldest_to_latest_then_camera_then_rgb",
+    "image_interval_control_steps": IMAGE_INTERVAL,
+    "proprio_dim": OBSERVATION_DIM,
+    "proprio_fields": ["joint_positions", "joint_velocities", "joint_targets",
+                      "previous_action", "episode_time_remaining"],
+}
 CONTROL_DT = .02
 SUBSTEPS = 20
 EPISODE_STEPS = 1000
@@ -62,6 +81,9 @@ def _scene_xml(robot_xml):
     root.find("option").attrib.update(timestep=".001", iterations="100",
                                       ls_iterations="50", impratio="100", tolerance="1e-6")
     world = root.find("worldbody")
+    # A fixed workspace view complements the moving wrist camera.
+    ET.SubElement(world, "camera", name="overview_cam", pos=".55 -.45 .55",
+                  xyaxes=".8159 .5800 0 -.419 .589 .694", fovy="52")
     ET.SubElement(world, "light", pos=".2 -.2 1.5", dir="0 0 -1")
     ET.SubElement(world, "geom", name="floor", type="plane", size="1 1 .1", rgba=".9 .92 .95 1")
     ET.SubElement(world, "geom", name="source_pad", type="box",
@@ -85,7 +107,8 @@ class SceneBundle:
     action_dim = ACTION_DIM
     num_balls = NUM_BALLS
 
-    def __init__(self, asset_dir, max_episode_steps=EPISODE_STEPS):
+    def __init__(self, asset_dir, max_episode_steps=EPISODE_STEPS,
+                 visual_device=None, camera_names=CAMERA_NAMES):
         self.asset_dir = Path(asset_dir).resolve()
         self.episode_steps = int(max_episode_steps)
         if self.episode_steps < 1:
@@ -93,6 +116,16 @@ class SceneBundle:
         robot_xml = self.asset_dir / "robotstudio_so101" / "so101.xml"
         self.xml = _scene_xml(robot_xml)
         self.model = mujoco.MjModel.from_xml_string(self.xml)
+        self.visual_device = str(visual_device or ("cuda:0" if torch.cuda.is_available() else "cpu"))
+        self.camera_names = tuple(camera_names)
+        if self.camera_names != CAMERA_NAMES:
+            raise ValueError("camera_names must match CAMERA_NAMES and the policy observation specification")
+        for name in self.camera_names:
+            if mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, name) < 0:
+                raise ValueError(f"Policy camera {name!r} is missing from the robot scene")
+        self.image_shape = (FRAME_STACK * len(self.camera_names) * 3, IMAGE_SIZE, IMAGE_SIZE)
+        self.observation_spec = dict(OBSERVATION_SPEC, camera_names=list(self.camera_names),
+                                     image_shape=list(self.image_shape))
         self.lower, self.upper = self.model.actuator_ctrlrange.T.copy()
         self.initial_pose = np.clip(INITIAL_ARM_POSE, self.lower, self.upper).astype(np.float32)
         self.ball_body_ids = np.array([self.model.body(f"ball{k}").id for k in range(NUM_BALLS)])
@@ -126,19 +159,126 @@ def _potential_numpy(balls, aperture, left, right, lifted, released, plate_conta
             np.clip(distance / .08, 0, 1))
 
 
+class _CameraStack:
+    """Native MJWarp RGB rendering shared by training and CPU-physics viewing.
+
+    Frames are ordered oldest to latest, each with cameras in CAMERA_NAMES order.
+    RGB is kept as uint8 so a PPO rollout does not store float32 image copies.
+    """
+    def __init__(self, bundle, num_envs=1, device=None, model=None, data=None):
+        self.bundle, self.num_envs = bundle, int(num_envs)
+        self.device = torch.device(device or bundle.visual_device)
+        wp.init()
+        self.wp_device = str(self.device) if self.device.type == "cuda" else "cpu"
+        self.stream = (wp.stream_from_torch(torch.cuda.current_stream(self.device))
+                       if self.device.type == "cuda" else None)
+        self.closed = False
+        with self.scope():
+            self.model = mjw.put_model(bundle.model) if model is None else model
+            self.data = (mjw.make_data(bundle.model, nworld=self.num_envs, nconmax=192, njmax=600)
+                         if data is None else data)
+            self.owns_physics = data is None
+            if self.owns_physics:
+                self.qpos = wp.to_torch(self.data.qpos)
+                self.qvel = wp.to_torch(self.data.qvel)
+                self.ctrl = wp.to_torch(self.data.ctrl)
+            try:
+                self.context = mjw.create_render_context(
+                    bundle.model, nworld=self.num_envs, cam_res=(IMAGE_SIZE, IMAGE_SIZE),
+                    cam_active=list(bundle.camera_names), render_rgb=True,
+                    render_depth=False, render_seg=False, use_textures=False,
+                    use_shadows=False, samples_per_pixel=1, enabled_geom_groups=[0, 1, 2])
+            except Exception as exc:
+                self.close()
+                raise RuntimeError(
+                    "Policy RGB rendering could not start. Use the pinned mujoco-warp "
+                    "version and a Colab GPU runtime; image observations cannot be replaced "
+                    "with exact simulator object coordinates."
+                ) from exc
+            self.rgb_buffers = [wp.zeros((self.num_envs, IMAGE_SIZE, IMAGE_SIZE),
+                                          dtype=wp.vec3, device=self.wp_device)
+                                for _ in bundle.camera_names]
+            self.rgb_views = [wp.to_torch(buffer) for buffer in self.rgb_buffers]
+            self.frames = torch.zeros(
+                (self.num_envs, FRAME_STACK, len(bundle.camera_names), 3, IMAGE_SIZE, IMAGE_SIZE),
+                dtype=torch.uint8, device=self.device)
+
+    def scope(self):
+        stack = contextlib.ExitStack()
+        stack.enter_context(wp.ScopedDevice(self.wp_device))
+        if self.stream is not None:
+            stack.enter_context(wp.ScopedStream(self.stream))
+        return stack
+
+    def refresh(self, update_mask=None, reset_mask=None, cpu_data=None):
+        """Render the current physical state; update only requested worlds' caches."""
+        if self.closed:
+            raise RuntimeError("The policy camera renderer is closed")
+        with self.scope():
+            if self.owns_physics:
+                if cpu_data is None:
+                    raise ValueError("CPU physical state is required for the policy cameras")
+                self.qpos.copy_(torch.as_tensor(cpu_data.qpos, device=self.device).unsqueeze(0))
+                self.qvel.copy_(torch.as_tensor(cpu_data.qvel, device=self.device).unsqueeze(0))
+                self.ctrl.copy_(torch.as_tensor(cpu_data.ctrl, device=self.device).unsqueeze(0))
+                mjw.forward(self.model, self.data)
+            # The caller has already forwarded shared training physics.
+            mjw.refit_bvh(self.model, self.data, self.context)
+            mjw.render(self.model, self.data, self.context)
+            cameras = []
+            for index, (buffer, view) in enumerate(zip(self.rgb_buffers, self.rgb_views)):
+                # Indices refer to the requested cam_active list, not model camera ids.
+                mjw.get_rgb(self.context, index, buffer)
+                cameras.append(view.permute(0, 3, 1, 2).mul(255).round().clamp(0, 255).to(torch.uint8))
+            current = torch.stack(cameras, dim=1)
+            update = (torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+                      if update_mask is None else torch.as_tensor(
+                          update_mask, dtype=torch.bool, device=self.device))
+            resets = (torch.zeros_like(update) if reset_mask is None else torch.as_tensor(
+                reset_mask, dtype=torch.bool, device=self.device))
+            shifted = torch.cat((self.frames[:, 1:], current[:, None]), dim=1)
+            repeated = current[:, None].expand(-1, FRAME_STACK, -1, -1, -1, -1)
+            replacement = torch.where(resets[:, None, None, None, None, None], repeated, shifted)
+            self.frames.copy_(torch.where(update[:, None, None, None, None, None],
+                                          replacement, self.frames))
+
+    def image(self):
+        return self.frames.reshape(self.num_envs, *self.bundle.image_shape)
+
+    def close(self):
+        if self.closed:
+            return
+        with self.scope():
+            wp.synchronize_device(self.wp_device)
+        self.closed = True
+        self.context = None
+        self.rgb_views = self.rgb_buffers = None
+        self.frames = None
+        self.model = self.data = None
+        if self.owns_physics:
+            self.qpos = self.qvel = self.ctrl = None
+
+
 class CPUEnv:
     observation_dim = OBSERVATION_DIM
     action_dim = ACTION_DIM
     num_balls = NUM_BALLS
 
-    def __init__(self, bundle, seed=7, jitter=.002, max_episode_steps=None):
+    def __init__(self, bundle, seed=7, jitter=.015, max_episode_steps=None):
         self.bundle, self.model = bundle, bundle.model
         self.episode_steps = int(max_episode_steps or bundle.episode_steps)
         self.jitter = float(jitter)
         self.rng = np.random.default_rng(seed)
         self.data = mujoco.MjData(self.model)
+        self.observation_spec = dict(bundle.observation_spec)
+        self.cameras = _CameraStack(bundle)
+        self._camera_image = None
         self.last_info = {}
-        self.reset(seed)
+        try:
+            self.reset(seed)
+        except Exception:
+            self.close()
+            raise
 
     @property
     def active_ball_index(self):
@@ -182,26 +322,32 @@ class CPUEnv:
         self.success = self.done = False
         self.failure = ""
         mujoco.mj_forward(self.model, self.data)
+        self._refresh_images(reset=True)
         self.last_info = self._info()
         return self.observation()
 
     def observation(self):
-        balls = self.data.qpos[self.bundle.ball_xyz_indices]
-        velocities = self.data.qvel[self.bundle.ball_velocity_indices]
+        # Only robot proprioception accompanies RGB. No ball pose, goal pose,
+        # contacts or reward bookkeeping is exposed to either actor or critic.
         lower, upper = self.bundle.lower, self.bundle.upper
-        return np.concatenate([
+        proprio = np.concatenate([
             2 * (self.data.qpos[:6] - lower) / (upper - lower) - 1,
             np.clip(self.data.qvel[:6] * .1, -5, 5),
             2 * (self.joint_targets - lower) / (upper - lower) - 1,
-            self.bundle.aperture(self.data) * 5,
-            ((balls - SOURCES) * 5).reshape(-1), np.clip(velocities, -5, 5).reshape(-1),
-            ((BALL_GOALS - balls) * 5).reshape(-1),
-            self.filled, np.eye(NUM_BALLS)[self.active_ball_index], self.lifted,
-            self.bilateral_seen, self.released,
-            np.clip(self.stable_steps / STABLE_STEPS, 0, 1), np.clip(self.lift_steps / LIFT_STEPS, 0, 1),
+            self.previous_action,
             [max(0., 1 - self.step_index / self.episode_steps)],
-            self.left_contacts, self.right_contacts, self.plate_contacts, self.previous_action,
         ]).astype(np.float32)
+        return {"image": self._camera_image.copy(),
+                "proprio": np.nan_to_num(proprio, nan=0., posinf=0., neginf=0.)}
+
+    def _refresh_images(self, reset=False):
+        self.cameras.refresh(reset_mask=[reset], cpu_data=self.data)
+        self._camera_image = self.cameras.image()[0].cpu().numpy().copy()
+
+    def close(self):
+        if getattr(self, "cameras", None) is not None:
+            self.cameras.close()
+            self.cameras = None
 
     def _jaw_contacts(self):
         """Read force-bearing jaw and plate contacts for the free ball."""
@@ -245,6 +391,7 @@ class CPUEnv:
             "failure": self.failure, "episode_steps": self.episode_steps,
             "control": "policy_joint_delta_targets", "task_id": TASK_ID,
             "plate_contacts": self.plate_contacts.tolist(),
+            "observation_spec": dict(self.observation_spec),
             "reward_components": dict(self.reward_components),
         }
 
@@ -315,32 +462,44 @@ class CPUEnv:
         truncated = bool(self.step_index >= self.episode_steps and not terminated)
         self.done = terminated or truncated
         self.last_info = self._info()
-        observation = np.nan_to_num(self.observation(), nan=0., posinf=0., neginf=0.)
-        return observation, reward, terminated, truncated, dict(self.last_info)
+        # Invalid terminal physics cannot be submitted to the renderer's BVH.
+        # Its observation retains the last valid image; terminals do not bootstrap.
+        if finite and (self.step_index % IMAGE_INTERVAL == 0 or self.done):
+            self._refresh_images()
+        return self.observation(), reward, terminated, truncated, dict(self.last_info)
 
 
 @torch.inference_mode()
 def evaluate_policy(bundle, policy=None, mode="learned", episodes=1, seed=2026,
-                    jitter=.002, max_episode_steps=None):
-    """Optional user-run evaluation; no scripted baseline or success precondition."""
+                    jitter=.015, max_episode_steps=None):
+    """Optional user-run image-policy evaluation; CPU physics and MJWarp RGB."""
     results = []
     rng = np.random.default_rng(seed)
     for episode in range(int(episodes)):
-        env = CPUEnv(bundle, seed=seed + episode, jitter=jitter, max_episode_steps=max_episode_steps)
-        obs = env.observation()
-        for _ in range(env.episode_steps):
-            if mode == "zero_action":
-                action = np.zeros(ACTION_DIM)
-            elif mode == "random":
-                action = rng.standard_normal(ACTION_DIM)
-            elif mode == "learned" and policy is not None:
-                action = policy.actor(torch.from_numpy(obs).unsqueeze(0)).squeeze(0).cpu().numpy()
-            else:
-                raise ValueError("Use learned with a policy, random, or zero_action")
-            obs, _, terminated, truncated, info = env.step(action)
-            if terminated or truncated:
-                break
-        results.append(info)
+        env = None
+        try:
+            env = CPUEnv(bundle, seed=seed + episode, jitter=jitter,
+                         max_episode_steps=max_episode_steps)
+            obs = env.observation()
+            for _ in range(env.episode_steps):
+                if mode == "zero_action":
+                    action = np.zeros(ACTION_DIM)
+                elif mode == "random":
+                    action = rng.standard_normal(ACTION_DIM)
+                elif mode == "learned" and policy is not None:
+                    policy_device = next(policy.parameters()).device
+                    batched = {key: torch.as_tensor(value, device=policy_device).unsqueeze(0)
+                               for key, value in obs.items()}
+                    action = policy.mean_action(batched).squeeze(0).cpu().numpy()
+                else:
+                    raise ValueError("Use learned with a policy, random, or zero_action")
+                obs, _, terminated, truncated, info = env.step(action)
+                if terminated or truncated:
+                    break
+            results.append(info)
+        finally:
+            if env is not None:
+                env.close()
     if not results:
         raise ValueError("episodes must be at least one")
     return {
@@ -352,8 +511,8 @@ def evaluate_policy(bundle, policy=None, mode="learned", episodes=1, seed=2026,
         "lift_rate": float(np.mean([np.mean(r["all_lifted"]) for r in results])),
         "release_rate": float(np.mean([np.mean(r["all_released"]) for r in results])),
         "episodes": results, "seed": int(seed), "jitter_m": float(jitter),
-        "backend": "CPU MuJoCo evaluation", "mode": mode,
-        "task_id": TASK_ID,
+        "backend": "CPU MuJoCo physics / native MuJoCo Warp RGB observations", "mode": mode,
+        "task_id": TASK_ID, "observation_spec": dict(bundle.observation_spec),
         "success_contract": "one physically grasped and lifted ball released onto the flat plate, supported and stable for 0.5 seconds",
     }
 
@@ -364,13 +523,14 @@ class WarpEnv:
     action_dim = ACTION_DIM
     num_balls = NUM_BALLS
 
-    def __init__(self, bundle, num_envs=8, device="cuda:0", seed=7, jitter=.002,
+    def __init__(self, bundle, num_envs=8, device="cuda:0", seed=7, jitter=.015,
                  capture_graph=False, max_episode_steps=None):
         self.bundle, self.num_envs = bundle, int(num_envs)
         if self.num_envs < 1:
             raise ValueError("num_envs must be positive")
         self.episode_steps = int(max_episode_steps or bundle.episode_steps)
         self.device = torch.device(device)
+        self.observation_spec = dict(bundle.observation_spec)
         # Torch stream conversion requires Warp's runtime to exist first.
         wp.init()
         self.wp_device = str(self.device) if self.device.type == "cuda" else "cpu"
@@ -433,6 +593,9 @@ class WarpEnv:
                 self.generator.set_state(initial_rng_state)
                 self._reset(torch.ones_like(self.success))
                 mjw.forward(self.model, self.data)
+            self.cameras = _CameraStack(bundle, self.num_envs, self.device,
+                                        model=self.model, data=self.data)
+            self.cameras.refresh(reset_mask=torch.ones_like(self.success))
 
     def scope(self):
         stack = contextlib.ExitStack()
@@ -478,22 +641,42 @@ class WarpEnv:
         return torch.where(self.filled.all(dim=1), NUM_BALLS - 1, active)
 
     def observation(self):
-        balls, velocities = self._balls(), self._velocities()
-        return torch.cat([
+        # Task coordinates and contact/success flags remain reward-internal.
+        proprio = torch.cat([
             2 * (self.qpos[:, :6] - self.lower) / (self.upper - self.lower) - 1,
             (self.qvel[:, :6] * .1).clamp(-5, 5),
             2 * (self.joint_targets - self.lower) / (self.upper - self.lower) - 1,
-            self._eef() * 5,
-            ((balls - self.sources) * 5).reshape(self.num_envs, -1),
-            velocities.clamp(-5, 5).reshape(self.num_envs, -1),
-            ((self.goals - balls) * 5).reshape(self.num_envs, -1),
-            self.filled.float(), torch.nn.functional.one_hot(self._active(), NUM_BALLS).float(),
-            self.lifted.float(), self.bilateral_seen.float(), self.released.float(),
-            (self.stable_steps / STABLE_STEPS).clamp(0, 1), (self.lift_steps / LIFT_STEPS).clamp(0, 1),
-            (1 - self.steps[:, None] / self.episode_steps).clamp_min(0),
-            self.left_contacts.float(), self.right_contacts.float(), self.plate_contacts.float(),
             self.previous_action,
+            (1 - self.steps[:, None] / self.episode_steps).clamp_min(0),
         ], dim=1)
+        return {"image": self.cameras.image(),
+                "proprio": torch.nan_to_num(proprio, nan=0., posinf=0., neginf=0.)}
+
+    def _refresh_images(self, update_mask, finite):
+        # Keep the last valid frame for nonfinite failure terminals. A render
+        # traverses every world's BVH, even when only some image caches update,
+        # so invalid worlds need a temporary finite render pose.
+        valid_updates = update_mask & finite
+        if not bool(valid_updates.any()):
+            return
+        if bool(finite.all()):
+            self.cameras.refresh(update_mask=valid_updates)
+            return
+        saved_qpos, saved_qvel = self.qpos.clone(), self.qvel.clone()
+        safe_qpos = torch.as_tensor(self.bundle.model.qpos0, dtype=self.qpos.dtype,
+                                    device=self.device).clone()
+        safe_qpos[:ACTION_DIM] = self.initial_pose
+        try:
+            self.qpos.copy_(torch.where(finite[:, None], self.qpos, safe_qpos[None]))
+            self.qvel.copy_(torch.where(finite[:, None], self.qvel, torch.zeros_like(self.qvel)))
+            mjw.forward(self.model, self.data)
+            self.cameras.refresh(update_mask=valid_updates)
+        finally:
+            # Preserve terminal proprioception until final_obs is copied.
+            # Do not forward invalid state: the caller resets all failed worlds
+            # immediately after recording terminal observations and metrics.
+            self.qpos.copy_(saved_qpos)
+            self.qvel.copy_(saved_qvel)
 
     def _potential(self):
         balls = self._balls()
@@ -599,7 +782,11 @@ class WarpEnv:
             self.steps.add_(1)
             truncated = (self.steps >= self.episode_steps) & ~terminated
             done = terminated | truncated
-            final_obs = torch.nan_to_num(self.observation(), nan=0., posinf=0., neginf=0.)
+            image_due = (self.steps.remainder(IMAGE_INTERVAL) == 0) | done
+            if bool(image_due.any()):
+                self._refresh_images(image_due, finite)
+            # Copy both fields before automatic resets overwrite camera history.
+            final_obs = {key: value.clone() for key, value in self.observation().items()}
             filled_count = self.filled.sum(dim=1)
             grid = torch.zeros_like(self.filled)
             grid[:, self.grid_order] = self.filled
@@ -618,4 +805,12 @@ class WarpEnv:
             if bool(done.any()):
                 self._reset(done)
                 mjw.forward(self.model, self.data)
+                # Every reset world gets only its new episode's initial frame.
+                self.cameras.refresh(update_mask=done, reset_mask=done)
             return self.observation(), reward, terminated, truncated, info
+
+    def close(self):
+        self.graph = None
+        if getattr(self, "cameras", None) is not None:
+            self.cameras.close()
+            self.cameras = None
